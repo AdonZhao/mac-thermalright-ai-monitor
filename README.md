@@ -62,8 +62,8 @@
 ```bash
 brew install libusb pkg-config
 
-git clone <你的仓库地址> MacTR
-cd MacTR
+git clone https://github.com/m1ng-li/mac-thermalright-ai-monitor.git
+cd mac-thermalright-ai-monitor
 swift build -c release
 
 .build/release/MacTR          # 菜单栏应用;驱动 LCD,或没接 LCD 时弹预览窗口

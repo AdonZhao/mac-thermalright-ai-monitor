@@ -74,8 +74,8 @@ for each agent, side by side:
 ```bash
 brew install libusb pkg-config
 
-git clone <your-repo-url> MacTR
-cd MacTR
+git clone https://github.com/m1ng-li/mac-thermalright-ai-monitor.git
+cd mac-thermalright-ai-monitor
 swift build -c release
 
 .build/release/MacTR          # menu-bar app; drives the LCD, or previews in a window
