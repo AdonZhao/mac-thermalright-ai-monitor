@@ -1,7 +1,8 @@
-// MonitorRenderer.swift — System Monitor 5-panel dashboard
+// MonitorRenderer.swift — System Monitor 3-panel dashboard
 //
-// Set 1: CPU | GPU | Memory | Disk | System
-// Ported from trcc_monitor.py render_* functions.
+// Set 1: CPU | AI AGENTS (triple width) | MEMORY
+// The AGENTS panel shows each agent's current activity (top) and today's
+// token usage + quota (bottom), sourced from local session transcripts.
 
 import AppKit
 import CoreGraphics
@@ -10,6 +11,7 @@ import Foundation
 final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     private let collector = SystemMetricsCollector()
+    private let agentCollector = AgentUsageCollector()
 
     // Background metrics collection — decoupled from frame loop for consistent refresh
     private let metricsQueue = DispatchQueue(label: "com.thermalvision.metrics")
@@ -19,29 +21,31 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // Cached snapshots (written by metricsQueue, read by render thread)
     private var _cpu: CPUSnapshot?
     private var _mem: MemorySnapshot?
-    private var _gpu: GPUSnapshot?
-    private var _disk: DiskSnapshot?
-    private var _net: NetworkSnapshot?
-    private var _diskIO: DiskIOSnapshot?
     private var _temp: TemperatureSnapshot?
-    private var _bat: BatterySnapshot?
+    private var _agents: AgentsSnapshot?
     private var _sys: SystemSnapshot?
 
     // Reusable CGContext — avoids allocating 3.6MB every 0.5s (prevents CG raster data leak)
     private var reusableCtx: CGContext?
 
-    // Ring buffers for sparklines (last 60 samples = 30 seconds)
-    private let sparklineSize = 60
-    private var netRxHistory: [Double] = []
-    private var netTxHistory: [Double] = []
-    private var diskReadHistory: [Double] = []
-    private var diskWriteHistory: [Double] = []
-    private var swapInHistory: [Double] = []
-    private var swapOutHistory: [Double] = []
+    // Test mode (--test-flash): force both columns into the flashing state until
+    // this deadline, to preview the alert visuals without waiting for a real event
+    private var testFlashUntil: Date?
 
-    private func pushSample(_ buffer: inout [Double], _ value: Double) {
-        buffer.append(value)
-        if buffer.count > sparklineSize { buffer.removeFirst() }
+    func enableTestFlash(seconds: TimeInterval) {
+        testFlashUntil = Date().addingTimeInterval(seconds)
+        log("[Metrics] Test flash enabled for \(Int(seconds))s")
+    }
+
+    private func withAttention(_ u: AgentUsage) -> AgentUsage {
+        AgentUsage(available: u.available,
+                   todayInputTokens: u.todayInputTokens,
+                   todayOutputTokens: u.todayOutputTokens,
+                   secondsSinceActive: u.secondsSinceActive,
+                   project: u.project, activity: u.activity,
+                   quotaUsedPercent: u.quotaUsedPercent,
+                   quotaResetsAt: u.quotaResetsAt,
+                   needsAttention: true)
     }
 
     /// Start background metrics collection. Call before first render().
@@ -56,16 +60,12 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         // First pass: prime CPU ticks (deltas will be zero)
         let cpu0 = collector.collectCPU()
         let mem = collector.collectMemory()
-        let bat = collector.collectBattery()
-        let sys = collector.collectSystem()
-        let gpu = collector.collectGPU()
-        let disk = collector.collectDisk()
-        let net = collector.collectNetwork()
-        let diskIO = collector.collectDiskIO()
         let temp = collector.collectTemperature()
+        let agents = agentCollector.collect()
+        let sys = collector.collectSystem()
         lock.lock()
-        _cpu = cpu0; _mem = mem; _bat = bat; _sys = sys
-        _gpu = gpu; _disk = disk; _net = net; _diskIO = diskIO; _temp = temp
+        _cpu = cpu0; _mem = mem
+        _temp = temp; _agents = agents; _sys = sys
         lock.unlock()
 
         // Second pass: get real CPU deltas
@@ -84,6 +84,18 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         metricsRunning = false
     }
 
+    /// True when a column has a live animation (breathing while working, or the
+    /// done/waiting blink) — the frame loop uses this to raise the LCD frame rate
+    /// only while something is actually moving, and idle low otherwise.
+    func wantsHighFrameRate() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // Heavy CPU → Pikachu crackles with electricity, worth animating smoothly
+        if let c = _cpu, c.total > 55 { return true }
+        guard let a = _agents else { return false }
+        return a.claude.isWorking || a.claude.needsAttention
+            || a.codex.isWorking || a.codex.needsAttention
+    }
+
     private func metricsLoop() {
         log("[Metrics] Loop started on metricsQueue")
         var slowTick = 0
@@ -91,22 +103,18 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             // Fast metrics every tick
             let cpu = collector.collectCPU()
             let mem = collector.collectMemory()
-            let bat = collector.collectBattery()
-            let sys = collector.collectSystem()
             lock.lock()
-            _cpu = cpu; _mem = mem; _bat = bat; _sys = sys
+            _cpu = cpu; _mem = mem
             lock.unlock()
 
-            // Slow metrics every 4th tick (~2s). net/diskIO are rates → need a steady interval.
+            // Slow metrics every 4th tick (~2s)
             slowTick += 1
             if slowTick >= 4 {
-                let gpu = collector.collectGPU()
-                let disk = collector.collectDisk()
-                let net = collector.collectNetwork()
-                let diskIO = collector.collectDiskIO()
                 let temp = collector.collectTemperature()
+                let agents = agentCollector.collect()
+                let sys = collector.collectSystem()
                 lock.lock()
-                _gpu = gpu; _disk = disk; _net = net; _diskIO = diskIO; _temp = temp
+                _temp = temp; _agents = agents; _sys = sys
                 lock.unlock()
                 slowTick = 0
             }
@@ -116,40 +124,70 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         log("[Metrics] Loop exited (metricsRunning=false)")
     }
 
-    /// Render with fully simulated data (for screenshots — no real system info)
-    func renderSimulated(coreCount: Int) -> CGImage? {
-        let fakeCores = (0..<coreCount).map { _ in Double.random(in: 5...95) }
-        let cpu = CPUSnapshot(perCore: fakeCores,
-                              total: fakeCores.reduce(0, +) / Double(coreCount),
-                              loadAvg: (3.5, 4.2, 3.8),
-                              pCoreCount: max(coreCount - 2, coreCount * 3 / 4))
+    // Demo mode: drive the display with polished fake data (for screenshots / photos
+    // and open-source showcase). Set before render(); the frame loop keeps its normal
+    // memory-safe path (reusable context + autoreleasepool) and animations stay live.
+    var demoMode = false
+
+    /// Deterministic showcase data. CPU cores gently wave over time so the demo looks
+    /// alive on the LCD; everything else is fixed so it reads clearly in a photo.
+    private func demoData() -> (CPUSnapshot, MemorySnapshot, TemperatureSnapshot,
+                                SystemSnapshot, AgentsSnapshot) {
+        let tt = Date().timeIntervalSince1970
+        let cores: [Double] = (0..<10).map { i in
+            let wave: Double = sin(tt * 1.3 + Double(i) * 0.9)
+            return 25.0 + 55.0 * (0.5 + 0.5 * wave)
+        }
+        let total: Double = cores.reduce(0.0, +) / 10.0
+        let cpu = CPUSnapshot(perCore: cores, total: total,
+                              loadAvg: (3.5, 4.2, 3.8), pCoreCount: 8)
         let gb: UInt64 = 1024 * 1024 * 1024
         let mem = MemorySnapshot(
-            total: 32 * gb, active: 8 * gb, wired: 4 * gb,
+            total: 32 * gb, active: 9 * gb, wired: 3 * gb,
             compressed: 2 * gb, available: 18 * gb,
             swapUsed: 512 * 1024 * 1024, swapTotal: 4 * gb,
-            swapInPerSec: 5_000_000, swapOutPerSec: 12_000_000,  // → red, visible snapshot
-            swapAvailable: true, pressure: 1)
-        let bat = BatterySnapshot(percent: 85, isCharging: false, isPresent: true)
-        let sys = SystemSnapshot(uptimeSeconds: 86400 + 7200 + 1800, processCount: 412)
-        let disk = DiskSnapshot(totalGB: 1000, usedGB: 420, freeGB: 580)
-        let net = NetworkSnapshot(rxBytesPerSec: 2_500_000, txBytesPerSec: 350_000)
-        let diskIO = DiskIOSnapshot(readBytesPerSec: 15_000_000, writeBytesPerSec: 8_000_000)
+            swapInPerSec: 0, swapOutPerSec: 0, swapAvailable: true, pressure: 1)
         let temp = TemperatureSnapshot(cpuTemp: 52, gpuTemp: 45, thermalState: 0)
-        let gpu = GPUSnapshot(name: "Apple GPU", cores: 30,
-                              deviceUtil: 12, rendererUtil: 8, tilerUtil: 5,
-                              memUsedMB: 1280, memAllocMB: 2560)
+        let sys = SystemSnapshot(uptimeSeconds: 27 * 3600 + 3 * 60, processCount: 612)
+        let agents = AgentsSnapshot(
+            claude: AgentUsage(available: true,
+                               todayInputTokens: 48_300_000, todayOutputTokens: 512_000,
+                               secondsSinceActive: 3, project: "MacTR",
+                               activity: """
+                               已完成 AI Agents 面板的三项优化，改动集中在两个文件：
 
-        // Fill sparklines with random history
-        for _ in 0..<sparklineSize {
-            pushSample(&netRxHistory, Double.random(in: 500_000...5_000_000))
-            pushSample(&netTxHistory, Double.random(in: 100_000...800_000))
-            pushSample(&diskReadHistory, Double.random(in: 1_000_000...30_000_000))
-            pushSample(&diskWriteHistory, Double.random(in: 500_000...15_000_000))
-            pushSample(&swapInHistory, Double.random(in: 1_000_000...20_000_000))
-            pushSample(&swapOutHistory, Double.random(in: 2_000_000...40_000_000))
-        }
+                               | 文件 | 改动 |
+                               |---|---|
+                               | Collector | 解析消息与待办 |
+                               | Renderer | 表格化排版 |
+                               """,
+                               isWorking: true,
+                               stepCurrent: 3, stepTotal: 4,
+                               stepText: "渲染 Claude 消息表格"),
+            codex: AgentUsage(available: true,
+                              todayInputTokens: 60_100_000, todayOutputTokens: 375_000,
+                              secondsSinceActive: 6, project: "web-service",
+                              activity: """
+                              已完成部署，四个服务全部推送到 `main`：
 
+                              | 服务 | 提交 | 文件 |
+                              |---|---|---:|
+                              | `api-gateway` | `a4872c56` | 24 |
+                              | `auth-service` | `4d6934de` | 10 |
+                              | `web-client` | `9b0e17aa` | 32 |
+                              | `job-worker` | `ac02bea6` | 88 |
+                              """,
+                              quotaUsedPercent: 57,
+                              quotaResetsAt: Date().addingTimeInterval(3600 * 24 * 6),
+                              isWorking: true,
+                              stepCurrent: 4, stepTotal: 6,
+                              stepText: "部署到预发环境并跑冒烟测试"))
+        return (cpu, mem, temp, sys, agents)
+    }
+
+    /// Render one demo frame with the showcase data (for --snapshot).
+    func renderSimulated(coreCount: Int) -> CGImage? {
+        let (cpu, mem, temp, sys, agents) = demoData()
         let w = Layout.width, h = Layout.height
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
@@ -158,33 +196,40 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         else { return nil }
         ctx.translateBy(x: 0, y: CGFloat(h)); ctx.scaleBy(x: 1, y: -1)
         Draw.gradientBackground(ctx)
-        renderCPU(ctx, cpu: cpu, temp: temp)
-        renderGPU(ctx, gpu: gpu, temp: temp, net: net)
-        renderMemory(ctx, mem: mem)
-        renderDisk(ctx, disk: disk, diskIO: diskIO)
-        renderSystem(ctx, bat: bat, sys: sys)
+        renderCPU(ctx, cpu: cpu, temp: temp, agentsBusy: true)
+        renderAgents(ctx, agents: agents)
+        renderMemory(ctx, mem: mem, sys: sys, agentsBusy: true)
         return ctx.makeImage()
     }
 
-    func render() -> CGImage? {
-        // Read cached metrics (never blocks — uses latest available values)
-        lock.lock()
-        guard let cpu = _cpu, let mem = _mem, let gpu = _gpu,
-              let disk = _disk, let net = _net, let diskIO = _diskIO,
-              let temp = _temp, let bat = _bat, let sys = _sys
-        else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
+    // Serializes render() callers — the USB frame loop and the on-Mac preview
+    // window can both render around a connect/disconnect transition, and they
+    // share reusableCtx + sparkline history
+    private let renderMutex = NSLock()
 
-        // Update sparkline histories
-        pushSample(&netRxHistory, net.rxBytesPerSec)
-        pushSample(&netTxHistory, net.txBytesPerSec)
-        pushSample(&diskReadHistory, diskIO.readBytesPerSec)
-        pushSample(&diskWriteHistory, diskIO.writeBytesPerSec)
-        pushSample(&swapInHistory, mem.swapInPerSec)
-        pushSample(&swapOutHistory, mem.swapOutPerSec)
+    func render() -> CGImage? {
+        renderMutex.lock()
+        defer { renderMutex.unlock() }
+
+        let cpu: CPUSnapshot, mem: MemorySnapshot, temp: TemperatureSnapshot
+        let sys: SystemSnapshot?
+        var agents: AgentsSnapshot
+        if demoMode {
+            (cpu, mem, temp, sys, agents) = demoData()
+        } else {
+            // Read cached metrics (never blocks — uses latest available values)
+            lock.lock()
+            guard let c = _cpu, let m = _mem, let tp = _temp, let a = _agents else {
+                lock.unlock(); return nil
+            }
+            cpu = c; mem = m; temp = tp; agents = a; sys = _sys
+            lock.unlock()
+        }
+
+        if let until = testFlashUntil, Date() < until {
+            agents = AgentsSnapshot(claude: withAttention(agents.claude),
+                                    codex: withAttention(agents.codex))
+        }
 
         // Reuse CGContext to prevent CG raster data memory growth
         let w = Layout.width
@@ -208,11 +253,11 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         Draw.gradientBackground(ctx)
 
         // Panels
-        renderCPU(ctx, cpu: cpu, temp: temp)
-        renderGPU(ctx, gpu: gpu, temp: temp, net: net)
-        renderMemory(ctx, mem: mem)
-        renderDisk(ctx, disk: disk, diskIO: diskIO)
-        renderSystem(ctx, bat: bat, sys: sys)
+        let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
+            || agents.codex.isWorking || agents.codex.needsAttention
+        renderCPU(ctx, cpu: cpu, temp: temp, agentsBusy: agentsBusy)
+        renderAgents(ctx, agents: agents)
+        renderMemory(ctx, mem: mem, sys: sys, agentsBusy: agentsBusy)
 
         let image = ctx.makeImage()
         ctx.restoreGState()
@@ -221,7 +266,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     // MARK: - CPU Panel
 
-    private func renderCPU(_ ctx: CGContext, cpu: CPUSnapshot, temp: TemperatureSnapshot) {
+    private func renderCPU(_ ctx: CGContext, cpu: CPUSnapshot, temp: TemperatureSnapshot,
+                           agentsBusy: Bool) {
         let x = Layout.panelX(0)
         let pw = Layout.panelWidth
         let py = Layout.panelY
@@ -286,122 +332,87 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: Fonts.system(fontSize), color: Color.textS)
         }
 
-        // Airflow temperature + Load average at panel bottom
-        let bottomY = py + ph - 92
+        // Pikachu in the left space below the gauge — its electricity scales with
+        // CPU load (the machine's "power draw"). While an AI agent is working it
+        // hops and turns to face left/right, like it's cheering the machine on.
+        if let pika = PikachuAsset.image {
+            let t = Date().timeIntervalSince1970
+            let size: CGFloat = 132
+            var rect = CGRect(x: CGFloat(x + 100) - size / 2, y: CGFloat(py + 210),
+                              width: size, height: size)
+            var flip = false
+            if agentsBusy {
+                let hop = CGFloat(abs(sin(t * .pi * 2)) * 9)   // ~2 hops/sec
+                rect.origin.y -= hop                            // up (flipped coords)
+                flip = Int(t * 2) % 4 >= 2                       // turn every ~1s
+            }
+            drawElectricity(ctx, around: rect, intensity: cpu.total, t: t)
+            drawImageUpright(ctx, pika, in: rect, flipX: flip)
+        }
+
+        // Temp + Load — large, spanning the full panel width at the bottom.
+        // Label on the left, value right-aligned to the panel edge.
+        let rightEdge = CGFloat(x + pw - 18)
+        let tempY = py + ph - 78
         if let cpuTemp = temp.cpuTemp {
             let tempColor = cpuTemp > 65 ? Color.red : (cpuTemp > 50 ? Color.orange : Color.green)
-            Draw.text(ctx, "Temp", x: x + 16, y: bottomY,
-                      font: Fonts.system(22, weight: .medium), color: Color.textL)
-            Draw.text(ctx, String(format: "%.0f°C", cpuTemp),
-                      x: x + 76, y: bottomY - 2,
-                      font: Fonts.system(30, weight: .bold), color: tempColor)
+            Draw.text(ctx, "Temp", x: x + 18, y: tempY + 8,
+                      font: Fonts.system(26, weight: .medium), color: Color.textL)
+            let vStr = String(format: "%.0f°C", cpuTemp)
+            let vFont = Fonts.system(42, weight: .bold)
+            let vW = (vStr as NSString).size(withAttributes: [.font: vFont]).width
+            Draw.text(ctx, vStr, x: Int(rightEdge - vW), y: tempY,
+                      font: vFont, color: tempColor)
         }
-
+        let loadY = py + ph - 34
         let (l1, l5, l15) = cpu.loadAvg
-        Draw.text(ctx, String(format: "Load  %.1f / %.1f / %.1f", l1, l5, l15),
-                  x: x + 16, y: bottomY + 38,
-                  font: Fonts.system(18), color: Color.textD)
+        Draw.text(ctx, "Load", x: x + 18, y: loadY,
+                  font: Fonts.system(22, weight: .medium), color: Color.textL)
+        let lStr = String(format: "%.1f / %.1f / %.1f", l1, l5, l15)
+        let lFont = Fonts.system(26, weight: .medium)
+        let lW = (lStr as NSString).size(withAttributes: [.font: lFont]).width
+        Draw.text(ctx, lStr, x: Int(rightEdge - lW), y: loadY,
+                  font: lFont, color: Color.textS)
     }
 
-    // MARK: - GPU Panel
-
-    private func renderGPU(_ ctx: CGContext, gpu: GPUSnapshot, temp: TemperatureSnapshot,
-                           net: NetworkSnapshot) {
-        let x = Layout.panelX(1)
-        let pw = Layout.panelWidth
-        let py = Layout.panelY
-
-        Draw.panel(ctx, x: x, y: py, w: pw, h: Layout.panelHeight, accent: Color.magenta)
-        Draw.text(ctx, "GPU", x: x + 20, y: py + 14,
-                  font: Fonts.system(24, weight: .bold), color: Color.magenta)
-        if gpu.cores > 0 {
-            Draw.text(ctx, "\(gpu.cores) cores", x: x + pw - 95, y: py + 16,
-                      font: Fonts.system(18), color: Color.textD)
+    /// Yellow lightning crackling around Pikachu — more/brighter bolts as `intensity`
+    /// (CPU %) rises. Flickers with `t` so it animates while the frame rate is high.
+    private func drawElectricity(_ ctx: CGContext, around rect: CGRect,
+                                 intensity: Double, t: Double) {
+        let level = min(max(intensity / 100, 0), 1)
+        let yellow = CGColor(red: 1.0, green: 0.9, blue: 0.15, alpha: 1)
+        let bolts = 2 + Int(level * 6)             // 2…8 bolts
+        ctx.setStrokeColor(yellow); ctx.setLineCap(.round); ctx.setLineJoin(.round)
+        for i in 0..<bolts {
+            // Twinkle: each bolt blinks on/off on its own phase
+            if (Int(t * 14) + i * 5) % 3 == 0 { continue }
+            let ang = Double(i) / Double(bolts) * 2 * .pi + t * 0.7
+            let ax = rect.midX + CGFloat(cos(ang)) * rect.width * 0.44
+            let ay = rect.midY + CGFloat(sin(ang)) * rect.height * 0.42
+            // Jagged 3-segment bolt pointing outward from the anchor
+            let len = CGFloat(9 + level * 15)
+            let dx = CGFloat(cos(ang)), dy = CGFloat(sin(ang))
+            let nx = -dy, ny = dx                  // perpendicular for the zigzag
+            ctx.setLineWidth(1.6 + CGFloat(level) * 1.2)
+            let jag = 4 + level * 3
+            ctx.move(to: CGPoint(x: ax, y: ay))
+            ctx.addLine(to: CGPoint(x: ax + dx * len * 0.4 + nx * CGFloat(jag),
+                                    y: ay + dy * len * 0.4 + ny * CGFloat(jag)))
+            ctx.addLine(to: CGPoint(x: ax + dx * len * 0.7 - nx * CGFloat(jag),
+                                    y: ay + dy * len * 0.7 - ny * CGFloat(jag)))
+            ctx.addLine(to: CGPoint(x: ax + dx * len, y: ay + dy * len))
+            ctx.strokePath()
         }
-
-        // Arc gauge
-        let gcx = x + 100, gcy = py + 138
-        Draw.arcGauge(ctx, cx: gcx, cy: gcy, radius: 70,
-                      percent: Double(gpu.deviceUtil),
-                      color: Color.magenta, colorDark: Color.magentaD, thickness: 13)
-        Draw.centeredText(ctx, "\(gpu.deviceUtil)", cx: gcx, y: gcy - 28,
-                          font: Fonts.system(50, weight: .bold), color: Color.textW)
-        Draw.centeredText(ctx, "%", cx: gcx, y: gcy + 24,
-                          font: Fonts.system(20), color: Color.textS)
-
-        // Utilization bars
-        let rx = x + 194
-        let rw = pw - 218
-        var ry = py + 48
-
-        Draw.text(ctx, "Utilization", x: rx, y: ry,
-                  font: Fonts.system(18), color: Color.textL)
-        ry += 28
-
-        let items: [(String, Int, CGColor)] = [
-            ("Device", gpu.deviceUtil, Color.magenta),
-            ("Renderer", gpu.rendererUtil, Color.purple),
-            ("Tiler", gpu.tilerUtil, Color.cyan),
-        ]
-        for (label, val, color) in items {
-            Draw.text(ctx, label, x: rx, y: ry,
-                      font: Fonts.system(19), color: Color.textL)
-            Draw.text(ctx, "\(val)%", x: rx + rw - 46, y: ry,
-                      font: Fonts.system(19), color: Color.textS)
-            Draw.bar(ctx, x: rx, y: ry + 24, w: rw, h: 10,
-                     percent: Double(val), color: color)
-            ry += 48
-        }
-
-        // GPU Memory — full-width single line: "GPU Memory   {used} / {alloc} MB"
-        // (unified memory share used by the GPU; In Use bold-white, Allocated dim)
-        let gmX = x + 16
-        let gmW = pw - 32
-        let gmY = py + 244
-        Draw.text(ctx, "GPU Memory", x: gmX, y: gmY,
-                  font: Fonts.system(20), color: Color.textL)
-        let usedFont = Fonts.system(19, weight: .semibold)
-        let allocFont = Fonts.system(19)
-        let usedPart = "\(gpu.memUsedMB)"
-        let allocPart = " / \(gpu.memAllocMB) MB"
-        let usedW = (usedPart as NSString).size(withAttributes: [.font: usedFont]).width
-        let allocW = (allocPart as NSString).size(withAttributes: [.font: allocFont]).width
-        let rightEdge = CGFloat(gmX + gmW)
-        Draw.text(ctx, usedPart, x: Int(rightEdge - allocW - usedW), y: gmY,
-                  font: usedFont, color: Color.textW)
-        Draw.text(ctx, allocPart, x: Int(rightEdge - allocW), y: gmY,
-                  font: allocFont, color: Color.textD)
-        if gpu.memAllocMB > 0 {
-            Draw.bar(ctx, x: gmX, y: gmY + 30, w: gmW, h: 11,
-                     percent: Double(gpu.memUsedMB) / Double(gpu.memAllocMB) * 100,
-                     color: Color.magenta)
-        }
-
-        // Network mirror bar chart — bottom (moved here from the Memory panel)
-        let netDividerY = py + Layout.panelHeight - 120
-        let netChartY = netDividerY + 22
-        let netChartH = py + Layout.panelHeight - netChartY - 6
-        Draw.line(ctx, from: CGPoint(x: x + 16, y: netDividerY),
-                  to: CGPoint(x: x + pw - 16, y: netDividerY), color: Color.border)
-        Draw.text(ctx, "Network", x: x + 16, y: netDividerY + 4,
-                  font: Fonts.system(17, weight: .medium), color: Color.textL)
-        Draw.mirrorBarChart(ctx,
-            topValues: netRxHistory, bottomValues: netTxHistory,
-            x: x + 16, y: netChartY, w: pw - 32, h: netChartH,
-            topColor: Color.cyan, bottomColor: Color.orange,
-            topLabel: "↓", bottomLabel: "↑",
-            topCurrent: Draw.formatBytesPerSec(net.rxBytesPerSec),
-            bottomCurrent: Draw.formatBytesPerSec(net.txBytesPerSec))
     }
 
     // MARK: - Memory Panel
 
-    private func renderMemory(_ ctx: CGContext, mem: MemorySnapshot) {
-        let x = Layout.panelX(2)
+    private func renderMemory(_ ctx: CGContext, mem: MemorySnapshot, sys: SystemSnapshot?,
+                              agentsBusy: Bool) {
+        let x = Layout.panelX(4)
         let pw = Layout.panelWidth
         let py = Layout.panelY
         let totalGB = Double(mem.total) / (1024 * 1024 * 1024)
-        let usedGB = Double(mem.total - mem.available) / (1024 * 1024 * 1024)
         let pct = mem.percent
 
         Draw.panel(ctx, x: x, y: py, w: pw, h: Layout.panelHeight, accent: Color.green)
@@ -444,205 +455,478 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ]
         for (label, val, color) in items {
             Draw.text(ctx, label, x: rx, y: ry,
-                      font: Fonts.system(19), color: Color.textL)
-            Draw.text(ctx, String(format: "%.1fG", val), x: rx + rw - 52, y: ry,
-                      font: Fonts.system(19), color: Color.textS)
+                      font: Fonts.system(17), color: Color.textL)
+            let valStr = String(format: "%.1fG", val)
+            let valFont = Fonts.system(17)
+            let valW = (valStr as NSString).size(withAttributes: [.font: valFont]).width
+            Draw.text(ctx, valStr, x: Int(CGFloat(rx + rw) - valW), y: ry,
+                      font: valFont, color: Color.textS)
             Draw.bar(ctx, x: rx, y: ry + 24, w: rw, h: 10,
                      percent: val / totalGB * 100, color: color)
             ry += 48
         }
 
-        // Swap block — bottom. In/out mirror chart (out↑ / in↓) like Network & Disk I/O,
-        // so all three trend blocks share one visual language. The always-drawn center
-        // axis signals "monitored" even when idle; N/A signals a real read failure.
-        // Severity color is driven by total ACTIVITY (not size): parked swap stays green.
-        let swapDividerY = py + Layout.panelHeight - 120
-        let swapX = x + 16
-        let swapW = pw - 32
-        Draw.line(ctx, from: CGPoint(x: swapX, y: swapDividerY),
-                  to: CGPoint(x: swapX + swapW, y: swapDividerY), color: Color.border)
-        Draw.text(ctx, "Swap", x: swapX, y: swapDividerY + 4,
-                  font: Fonts.system(17, weight: .medium), color: Color.textL)
+        // Bottom: a Bongo Cat tapping the divider "table", then the clock below it.
+        // (Swap monitoring removed — this space now shows the date/time.)
+        let ph = Layout.panelHeight
+        let dividerY = py + ph - 116
+        let cx0 = x + 16
+        let cw = pw - 32
+        Draw.line(ctx, from: CGPoint(x: cx0, y: dividerY),
+                  to: CGPoint(x: cx0 + cw, y: dividerY), color: Color.border)
 
-        if !mem.swapAvailable {
-            // Monitoring FAILURE — visibly distinct from a healthy idle swap (no chart)
-            let naFont = Fonts.system(17, weight: .semibold)
-            let naW = ("N/A" as NSString).size(withAttributes: [.font: naFont]).width
-            Draw.text(ctx, "N/A", x: Int(CGFloat(swapX + swapW) - naW), y: swapDividerY + 4,
-                      font: naFont, color: Color.textD)
-            Draw.text(ctx, "monitoring unavailable", x: swapX, y: swapDividerY + 40,
-                      font: Fonts.system(15), color: Color.textD)
-        } else {
-            // Used size on the header line (right-aligned, white). Total dynamic → show used only.
-            let swapUsedG = Double(mem.swapUsed) / (1024 * 1024 * 1024)
-            let sizeFont = Fonts.system(17, weight: .semibold)
-            let sizeStr = String(format: "%.1f GB", swapUsedG)
-            let sizeW = (sizeStr as NSString).size(withAttributes: [.font: sizeFont]).width
-            Draw.text(ctx, sizeStr, x: Int(CGFloat(swapX + swapW) - sizeW), y: swapDividerY + 4,
-                      font: sizeFont, color: Color.textW)
+        // Bongo cat sits on the left, tapping the divider when an agent is busy
+        let t = Date().timeIntervalSince1970
+        let tapPhase = Int(t * 5) % 2 == 0
+        drawBongoCat(ctx, cx: x + 96, baseY: dividerY, tapping: agentsBusy, phase: tapPhase)
 
-            // Severity color by total activity (in+out)
-            let total = mem.swapInPerSec + mem.swapOutPerSec
-            let swapColor: CGColor = total < 256_000 ? Color.green
-                : (total < 10_000_000 ? Color.orange : Color.red)
-
-            let chartY = swapDividerY + 22
-            let chartH = py + Layout.panelHeight - chartY - 6
-            Draw.mirrorBarChart(ctx,
-                topValues: swapOutHistory, bottomValues: swapInHistory,
-                x: swapX, y: chartY, w: swapW, h: chartH,
-                topColor: swapColor, bottomColor: swapColor,
-                topLabel: "out", bottomLabel: "in",
-                topCurrent: Draw.formatBytesPerSec(mem.swapOutPerSec),
-                bottomCurrent: Draw.formatBytesPerSec(mem.swapInPerSec))
-        }
-    }
-
-    // MARK: - Disk Panel
-
-    private func renderDisk(_ ctx: CGContext, disk: DiskSnapshot, diskIO: DiskIOSnapshot) {
-        let x = Layout.panelX(3)
-        let pw = Layout.panelWidth
-        let py = Layout.panelY
-        let dpct = disk.percent
-
-        Draw.panel(ctx, x: x, y: py, w: pw, h: Layout.panelHeight, accent: Color.orange)
-        Draw.text(ctx, "DISK", x: x + 20, y: py + 14,
-                  font: Fonts.system(24, weight: .bold), color: Color.orange)
-        Draw.text(ctx, String(format: "%.0f GB", disk.totalGB), x: x + pw - 85, y: py + 16,
-                  font: Fonts.system(18), color: Color.textD)
-
-        // Arc gauge
-        let gcx = x + 100, gcy = py + 138
-        Draw.arcGauge(ctx, cx: gcx, cy: gcy, radius: 70,
-                      percent: dpct,
-                      color: Color.forPercent(dpct),
-                      colorDark: Color.forPercentDark(dpct), thickness: 13)
-        Draw.centeredText(ctx, String(format: "%.0f", dpct), cx: gcx, y: gcy - 28,
-                          font: Fonts.system(50, weight: .bold), color: Color.textW)
-        Draw.centeredText(ctx, "%", cx: gcx, y: gcy + 24,
-                          font: Fonts.system(20), color: Color.textS)
-
-        // Details
-        let rx = x + 194
-        let rw = pw - 218
-        var ry = py + 48
-
-        Draw.text(ctx, "Storage", x: rx, y: ry,
-                  font: Fonts.system(18), color: Color.textL)
-        ry += 30
-
-        let diskItems: [(String, Double, CGColor)] = [
-            ("Used", disk.usedGB, Color.orange),
-            ("Free", disk.freeGB, Color.green),
-        ]
-        for (label, val, color) in diskItems {
-            Draw.text(ctx, label, x: rx, y: ry,
-                      font: Fonts.system(22), color: Color.textL)
-            Draw.text(ctx, String(format: "%.0f GB", val), x: rx + rw - 80, y: ry,
-                      font: Fonts.system(22), color: Color.textS)
-            Draw.bar(ctx, x: rx, y: ry + 30, w: rw, h: 12,
-                     percent: val / disk.totalGB * 100, color: color)
-            ry += 62
-        }
-
-        // Disk I/O mirror bar chart — same divider/chart size as Network
-        let ioDividerY = py + Layout.panelHeight - 120  // same as Network
-        let ioChartY = ioDividerY + 22
-        let ioX = x + 12
-        let ioW = pw - 24
-        let ioChartH = py + Layout.panelHeight - ioChartY - 6
-
-        Draw.line(ctx, from: CGPoint(x: ioX, y: ioDividerY),
-                  to: CGPoint(x: ioX + ioW, y: ioDividerY), color: Color.border)
-        Draw.text(ctx, "I/O", x: ioX, y: ioDividerY + 4,
-                  font: Fonts.system(17, weight: .medium), color: Color.textL)
-        Draw.mirrorBarChart(ctx,
-            topValues: diskReadHistory, bottomValues: diskWriteHistory,
-            x: ioX, y: ioChartY, w: ioW, h: ioChartH,
-            topColor: Color.green, bottomColor: Color.orange,
-            topLabel: "R", bottomLabel: "W",
-            topCurrent: Draw.formatBytesPerSec(diskIO.readBytesPerSec),
-            bottomCurrent: Draw.formatBytesPerSec(diskIO.writeBytesPerSec))
-    }
-
-    // MARK: - System Panel
-
-    private func renderSystem(_ ctx: CGContext, bat: BatterySnapshot, sys: SystemSnapshot) {
-        let x = Layout.panelX(4)
-        let pw = Layout.panelWidth
-        let py = Layout.panelY
-
-        Draw.panel(ctx, x: x, y: py, w: pw, h: Layout.panelHeight, accent: Color.cyan)
-        Draw.text(ctx, "SYSTEM", x: x + 20, y: py + 14,
-                  font: Fonts.system(24, weight: .bold), color: Color.cyan)
-
-        // Clock
+        // Right of the cat: date, weekday, uptime, processes
         let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        let timeStr = formatter.string(from: Date())
-        Draw.text(ctx, timeStr, x: x + 16, y: py + 48,
-                  font: Fonts.system(56, weight: .medium), color: Color.textW)
-
-        // Date
         formatter.locale = Locale(identifier: "en_US")
+        let ix = x + 190
         formatter.dateFormat = "yyyy-MM-dd"
-        let dateStr = formatter.string(from: Date())
-        Draw.text(ctx, dateStr, x: x + 20, y: py + 130,
-                  font: Fonts.system(24), color: Color.textS)
-
+        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 196,
+                  font: Fonts.system(22, weight: .semibold), color: Color.textW)
         formatter.dateFormat = "EEEE"
-        let dayStr = formatter.string(from: Date())
-        Draw.text(ctx, dayStr, x: x + 20, y: py + 160,
-                  font: Fonts.system(20), color: Color.textL)
+        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 170,
+                  font: Fonts.system(16), color: Color.textS)
 
-        // Divider
-        Draw.line(ctx, from: CGPoint(x: x + 16, y: Layout.height - (py + 192)),
-                  to: CGPoint(x: x + pw - 16, y: Layout.height - (py + 192)),
-                  color: Color.border)
+        let iw = pw - (ix - x) - 16
+        func stat(_ label: String, _ value: String, _ sy: Int) {
+            Draw.text(ctx, label, x: ix, y: sy, font: Fonts.system(15), color: Color.textL)
+            let vf = Fonts.system(15, weight: .medium)
+            let vw = (value as NSString).size(withAttributes: [.font: vf]).width
+            Draw.text(ctx, value, x: Int(CGFloat(ix + iw) - vw), y: sy, font: vf, color: Color.textS)
+        }
+        if let sys {
+            let h = sys.uptimeSeconds / 3600, m = (sys.uptimeSeconds % 3600) / 60
+            let up = h >= 24 ? "\(h / 24)d \(h % 24)h" : "\(h)h \(m)m"
+            stat("Uptime", up, py + ph - 142)
+            stat("Procs", "\(sys.processCount)", py + ph - 120)
+        }
 
-        // System info
-        var ry = py + 208
-        let rx = x + 20
-        let rw = pw - 40
+        // Clock — big, centered across the full panel width, below the divider
+        formatter.dateFormat = "HH:mm:ss"
+        Draw.centeredText(ctx, formatter.string(from: Date()),
+                          cx: x + pw / 2, y: dividerY + 30,
+                          font: Fonts.system(66, weight: .medium), color: Color.textW)
+    }
 
-        // Uptime
-        let hours = sys.uptimeSeconds / 3600
-        let mins = (sys.uptimeSeconds % 3600) / 60
-        Draw.text(ctx, "Uptime", x: rx, y: ry,
-                  font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, "\(hours)h \(mins)m", x: rx + rw - 80, y: ry,
-                  font: Fonts.system(19), color: Color.textS)
-        ry += 32
+    // MARK: - Bongo Cat (real line-art sprite, kuroni/bongocat-osu)
 
-        // Processes
-        Draw.text(ctx, "Processes", x: rx, y: ry,
-                  font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, "\(sys.processCount)", x: rx + rw - 55, y: ry,
-                  font: Fonts.system(19), color: Color.textS)
-        ry += 32
+    /// Draw the classic Bongo Cat: the real line-art head sprite peeking over a desk,
+    /// with a keyboard and two pink paws that slap it (`baseY` is the desk line). When
+    /// `tapping`, the paws alternate; otherwise they rest and a "z" floats up.
+    private func drawBongoCat(_ ctx: CGContext, cx: Int, baseY: Int, tapping: Bool, phase: Bool) {
+        let dark = CGColor(red: 30/255, green: 34/255, blue: 48/255, alpha: 1)
+        let pink = CGColor(red: 244/255, green: 150/255, blue: 174/255, alpha: 1)
+        let kbTop = CGColor(red: 210/255, green: 216/255, blue: 230/255, alpha: 1)
+        let cxD = CGFloat(cx), b = CGFloat(baseY)
 
-        // Load average (from CPU — re-collect quickly)
-        var loadavg: [Double] = [0, 0, 0]
-        getloadavg(&loadavg, 3)
-        Draw.text(ctx, "Load Avg", x: rx, y: ry,
-                  font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, String(format: "%.1f / %.1f / %.1f", loadavg[0], loadavg[1], loadavg[2]),
-                  x: rx + rw - 125, y: ry,
-                  font: Fonts.system(19), color: Color.textS)
-        ry += 32
+        // --- Keyboard on the desk ---
+        let kbW: CGFloat = 152, kbH: CGFloat = 15
+        let kbX = cxD - kbW / 2, kbY = b - kbH
+        let kbPath = CGPath(roundedRect: CGRect(x: kbX, y: kbY, width: kbW, height: kbH),
+                            cornerWidth: 4, cornerHeight: 4, transform: nil)
+        ctx.setFillColor(kbTop); ctx.addPath(kbPath); ctx.fillPath()
+        ctx.setStrokeColor(dark); ctx.setLineWidth(1.5); ctx.addPath(kbPath); ctx.strokePath()
+        ctx.setLineWidth(1)
+        var kx = kbX + 13
+        while kx < kbX + kbW - 6 {
+            ctx.move(to: CGPoint(x: kx, y: kbY + 2)); ctx.addLine(to: CGPoint(x: kx, y: kbY + kbH - 2))
+            kx += 13
+        }
+        ctx.strokePath()
 
-        // Battery
-        if bat.isPresent {
-            let color = bat.isCharging ? Color.green : (bat.percent > 20 ? Color.orange : Color.red)
-            let status = "\(bat.percent)% \(bat.isCharging ? "Charging" : "Battery")"
-            Draw.text(ctx, "Battery", x: rx, y: ry,
-                      font: Fonts.system(19), color: Color.textL)
-            Draw.text(ctx, status, x: rx + rw - 130, y: ry,
-                      font: Fonts.system(19), color: color)
-            ry += 26
-            Draw.bar(ctx, x: rx, y: ry, w: rw, h: 10,
-                     percent: Double(bat.percent), color: color)
+        // --- Cat head sprite, chin just above the keyboard ---
+        if let cat = BongoCatAsset.image {
+            let cw: CGFloat = 148
+            let ch = cw * CGFloat(cat.height) / CGFloat(cat.width)
+            let rect = CGRect(x: cxD - cw / 2, y: kbY - 4 - ch, width: cw, height: ch)
+            drawImageUpright(ctx, cat, in: rect)
+        }
+
+        // --- Pink paws resting on / slapping the keyboard, outlined to match line art ---
+        let pawRX: CGFloat = 13, pawRY: CGFloat = 10
+        let downY = kbY + 2, upY = kbY - 14         // down = on keys, up = lifted to tap
+        let lY = tapping ? (phase ? upY : downY) : downY
+        let rY = tapping ? (phase ? downY : upY) : downY
+        for (px, py2) in [(cxD - 34, lY), (cxD + 34, rY)] {
+            let r = CGRect(x: px - pawRX, y: py2 - pawRY, width: pawRX * 2, height: pawRY * 2)
+            ctx.setFillColor(pink); ctx.fillEllipse(in: r)
+            ctx.setStrokeColor(dark); ctx.setLineWidth(2); ctx.strokeEllipse(in: r)
+        }
+
+        // Zzz when dozing
+        if !tapping {
+            Draw.text(ctx, "z", x: Int(cxD) + 60, y: Int(kbY) - 74,
+                      font: Fonts.system(16, weight: .bold), color: Color.textL)
+            Draw.text(ctx, "z", x: Int(cxD) + 72, y: Int(kbY) - 88,
+                      font: Fonts.system(12, weight: .bold), color: Color.textD)
         }
     }
+
+    /// Draw a CGImage upright inside `rect` within the flipped (y-down) context.
+    /// `flipX` mirrors it horizontally (for facing left/right).
+    private func drawImageUpright(_ ctx: CGContext, _ image: CGImage, in rect: CGRect,
+                                 flipX: Bool = false) {
+        ctx.saveGState()
+        if flipX {
+            ctx.translateBy(x: rect.maxX, y: rect.minY + rect.height)
+            ctx.scaleBy(x: -1, y: -1)
+        } else {
+            ctx.translateBy(x: rect.minX, y: rect.minY + rect.height)
+            ctx.scaleBy(x: 1, y: -1)
+        }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: rect.width, height: rect.height))
+        ctx.restoreGState()
+    }
+
+    // MARK: - AI Agents Panel (triple width)
+
+    private func renderAgents(_ ctx: CGContext, agents: AgentsSnapshot) {
+        let x = Layout.panelX(1)
+        let pw = Layout.panelWidth * 3 + Layout.gap * 2
+        let py = Layout.panelY
+        let ph = Layout.panelHeight
+
+        Draw.panel(ctx, x: x, y: py, w: pw, h: ph, accent: Color.purple)
+        Draw.text(ctx, "AI AGENTS", x: x + 20, y: py + 14,
+                  font: Fonts.system(24, weight: .bold), color: Color.purple)
+
+        // Vertical divider between columns
+        let midX = x + pw / 2
+        Draw.line(ctx, from: CGPoint(x: midX, y: py + 52),
+                  to: CGPoint(x: midX, y: py + ph - 14), color: Color.border)
+
+        let colW = pw / 2 - 40
+        renderAgentColumn(ctx, x: x + 22, w: colW, py: py,
+                          name: "CLAUDE", accent: Color.claude, usage: agents.claude)
+        renderAgentColumn(ctx, x: midX + 18, w: colW, py: py,
+                          name: "CODEX", accent: Color.cyan, usage: agents.codex)
+    }
+
+    private func renderAgentColumn(_ ctx: CGContext, x: Int, w: Int, py: Int,
+                                   name: String, accent: CGColor, usage: AgentUsage) {
+        let ph = Layout.panelHeight
+
+        // Column background — three states, agent-tinted:
+        //   needsAttention (done / waiting) → hard on/off blink (high-contrast alert)
+        //   isWorking      (running a turn)  → slow, gentle breathing (~5s period)
+        //   idle                            → static tint
+        // render() runs every 0.5s, smooth enough for both sin() and the blink.
+        let bgRect = CGRect(x: CGFloat(x - 12), y: CGFloat(py + 42),
+                            width: CGFloat(w + 24), height: CGFloat(ph - 56))
+        let bgPath = CGPath(roundedRect: bgRect, cornerWidth: 12, cornerHeight: 12,
+                            transform: nil)
+        let base: CGFloat = name == "CLAUDE" ? 0.09 : 0.08
+        let t = Date().timeIntervalSince1970
+        let blinkOn = Int(t * 2) % 2 == 0
+        // Linear triangle breathing (0→1→0 over 5s). A constant per-frame delta reads
+        // far smoother than cosine easing at the display's low frame rate — no stutter
+        // where the cosine flattens near its peaks/troughs.
+        let phase = t.truncatingRemainder(dividingBy: 5) / 5        // 0..1
+        let breath = CGFloat(phase < 0.5 ? phase * 2 : (1 - phase) * 2)
+        var bgAlpha = base
+        if usage.needsAttention {
+            bgAlpha = blinkOn ? 0.36 : 0.10
+        } else if usage.isWorking {
+            bgAlpha = base + 0.13 * breath
+        }
+        ctx.setFillColor(accent.copy(alpha: bgAlpha) ?? accent)
+        ctx.addPath(bgPath)
+        ctx.fillPath()
+        if usage.needsAttention {
+            ctx.setStrokeColor(accent.copy(alpha: blinkOn ? 0.9 : 0.25) ?? accent)
+            ctx.setLineWidth(2)
+            ctx.addPath(bgPath)
+            ctx.strokePath()
+        } else if usage.isWorking {
+            // Faint breathing border to reinforce the "alive/working" feel
+            ctx.setStrokeColor(accent.copy(alpha: 0.12 + 0.28 * breath) ?? accent)
+            ctx.setLineWidth(1.5)
+            ctx.addPath(bgPath)
+            ctx.strokePath()
+        }
+
+        // Header: name + activity indicator (right-aligned "● now" / "12m ago")
+        Draw.text(ctx, name, x: x, y: py + 50,
+                  font: Fonts.system(24, weight: .bold), color: accent)
+        let active = (usage.secondsSinceActive ?? Int.max) < 90
+        let agoStr: String
+        if !usage.available {
+            agoStr = "not found"
+        } else if let s = usage.secondsSinceActive {
+            agoStr = active ? "now"
+                : (s < 3600 ? "\(s / 60)m ago"
+                   : (s < 86400 ? "\(s / 3600)h ago" : "\(s / 86400)d ago"))
+        } else {
+            agoStr = "no session"
+        }
+        let agoFont = Fonts.system(17, weight: .medium)
+        let agoColor = active ? Color.green : Color.textD
+        let agoW = (agoStr as NSString).size(withAttributes: [.font: agoFont]).width
+        Draw.text(ctx, agoStr, x: Int(CGFloat(x + w) - agoW), y: py + 56,
+                  font: agoFont, color: agoColor)
+        let dotR: CGFloat = 5
+        ctx.setFillColor(agoColor)
+        ctx.fillEllipse(in: CGRect(x: CGFloat(x + w) - agoW - dotR * 2 - 8,
+                                   y: CGFloat(py + 56) + 10 - dotR,
+                                   width: dotR * 2, height: dotR * 2))
+
+        // Current session — TOP. Project (+ step badge), plan progress, live activity.
+        var y = py + 90
+        if let project = usage.project {
+            // Step badge "步骤 4/6" right-aligned on the project line, when a plan exists
+            var projMaxW = CGFloat(w)
+            if let cur = usage.stepCurrent, let total = usage.stepTotal {
+                let badge = "步骤 \(cur)/\(total)"
+                let bFont = Fonts.system(18, weight: .semibold)
+                let bW = (badge as NSString).size(withAttributes: [.font: bFont]).width
+                Draw.text(ctx, badge, x: Int(CGFloat(x + w) - bW), y: y + 4,
+                          font: bFont, color: accent)
+                projMaxW = CGFloat(w) - bW - 16
+            }
+            Draw.text(ctx, truncate(project, font: Fonts.system(26, weight: .semibold),
+                                    maxW: projMaxW),
+                      x: x, y: y, font: Fonts.system(26, weight: .semibold), color: Color.textW)
+            y += 38
+        }
+
+        // Plan progress — compact segmented bar (the badge conveys N/M; no text line,
+        // so the message below gets the room)
+        if let cur = usage.stepCurrent, let total = usage.stepTotal, total > 0 {
+            drawStepBar(ctx, x: x, y: y, w: w, current: cur, total: total, accent: accent)
+            y += 20
+        }
+
+        // Latest message — what the agent last said (never the commands it ran).
+        // Markdown tables/lists are laid out structurally; plain text just wraps.
+        let actText = usage.activity ?? (usage.available ? "空闲" : "—")
+        let msgBottom = py + ph - 140   // token divider sits here
+        renderMessage(ctx, text: actText, x: x, y: y, w: w, bottom: msgBottom, accent: accent)
+
+        // Token usage — large, anchored near the bottom of the column
+        let tokY = py + ph - 126
+        Draw.line(ctx, from: CGPoint(x: x, y: tokY - 12),
+                  to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
+        Draw.text(ctx, "今日 Token", x: x, y: tokY,
+                  font: Fonts.system(19), color: Color.textL)
+        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+                  font: Fonts.system(46, weight: .bold), color: Color.textW)
+
+        // In / Out — right-aligned, level with the label + big number
+        let ioFont = Fonts.system(20, weight: .medium)
+        let ioRows: [(String, UInt64)] = [
+            ("In", usage.todayInputTokens),
+            ("Out", usage.todayOutputTokens),
+        ]
+        for (i, row) in ioRows.enumerated() {
+            let ry = tokY + 6 + i * 30
+            let valStr = formatTokensCN(row.1)
+            let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
+            Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
+                      font: ioFont, color: Color.textS)
+            let labelW = (row.0 as NSString).size(withAttributes: [.font: ioFont]).width
+            Draw.text(ctx, row.0, x: Int(CGFloat(x + w) - valW - labelW - 10), y: ry,
+                      font: ioFont, color: Color.textL)
+        }
+
+        // Quota (Codex): remaining percentage + reset countdown + bar
+        if let used = usage.quotaUsedPercent {
+            let remaining = max(0, 100 - used)
+            let qColor: CGColor = remaining > 50 ? Color.green
+                : (remaining > 20 ? Color.orange : Color.red)
+            let qy = tokY + 78
+            Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
+                      font: Fonts.system(21, weight: .medium), color: qColor)
+            if let resets = usage.quotaResetsAt {
+                let secs = max(0, Int(resets.timeIntervalSinceNow))
+                let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
+                    : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
+                let rFont = Fonts.system(17)
+                let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
+                Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
+                          font: rFont, color: Color.textD)
+            }
+            Draw.bar(ctx, x: x, y: qy + 28, w: w, h: 8,
+                     percent: remaining, color: qColor)
+        }
+    }
+
+    /// Segmented plan-progress bar: completed steps solid, current bright, pending dim.
+    private func drawStepBar(_ ctx: CGContext, x: Int, y: Int, w: Int,
+                             current: Int, total: Int, accent: CGColor) {
+        guard total > 0 else { return }
+        let gap = 4
+        let segW = (w - gap * (total - 1)) / total
+        guard segW > 0 else { return }
+        for i in 0..<total {
+            let sx = x + i * (segW + gap)
+            let color: CGColor
+            if i < current - 1 {          // completed
+                color = accent.copy(alpha: 0.5) ?? accent
+            } else if i == current - 1 {  // current
+                color = accent
+            } else {                      // pending
+                color = Color.barBG
+            }
+            let rect = CGRect(x: CGFloat(sx), y: CGFloat(y), width: CGFloat(segW), height: 7)
+            ctx.setFillColor(color)
+            ctx.addPath(CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil))
+            ctx.fillPath()
+        }
+    }
+
+    /// 中文数量格式："33.99万"、"1.02亿"。1万以下显示原始数字。
+    private func formatTokensCN(_ n: UInt64) -> String {
+        let v = Double(n)
+        if v >= 1e8 {
+            let y = v / 1e8
+            return String(format: y < 100 ? "%.2f亿" : "%.1f亿", y)
+        }
+        if v >= 1e4 {
+            let w = v / 1e4
+            return String(format: w < 100 ? "%.2f万" : (w < 1000 ? "%.1f万" : "%.0f万"), w)
+        }
+        return "\(n)"
+    }
+
+    // MARK: - Agent message layout (markdown-aware)
+
+    /// Render an agent message top-down within [y, bottom): markdown tables become
+    /// aligned grids, `- ` bullets and prose wrap. Stops when vertical space runs out.
+    private func renderMessage(_ ctx: CGContext, text: String, x: Int, y: Int, w: Int,
+                               bottom: Int, accent: CGColor) {
+        let proseFont = Fonts.system(19)
+        let lineH = 26
+        var cy = y
+        let raw = text.components(separatedBy: "\n")
+        var i = 0
+        while i < raw.count && cy + 20 <= bottom {
+            let line = raw[i].trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { i += 1; continue }
+
+            if isTableLine(line) {
+                // Consume the contiguous run of table rows and render as a grid
+                var block: [String] = []
+                while i < raw.count && isTableLine(raw[i].trimmingCharacters(in: .whitespaces)) {
+                    block.append(raw[i].trimmingCharacters(in: .whitespaces))
+                    i += 1
+                }
+                cy = renderTable(ctx, rows: block, x: x, y: cy, w: w, bottom: bottom, accent: accent)
+            } else {
+                // Prose / bullet — wrap, but cap each block so a table below still fits
+                let remaining = (bottom - cy) / lineH
+                guard remaining > 0 else { break }
+                let wrapped = wrap(stripMarkdown(line), font: proseFont,
+                                   maxW: CGFloat(w), maxLines: min(2, remaining))
+                for wl in wrapped {
+                    if cy + lineH > bottom { break }
+                    Draw.text(ctx, wl, x: x, y: cy, font: proseFont, color: Color.textS)
+                    cy += lineH
+                }
+                i += 1
+            }
+        }
+    }
+
+    private func isTableLine(_ s: String) -> Bool {
+        s.hasPrefix("|") && s.filter { $0 == "|" }.count >= 2
+    }
+
+    /// A markdown separator cell like `---`, `:--`, `--:`, `:-:`.
+    private func isSeparatorCell(_ s: String) -> Bool {
+        !s.isEmpty && s.allSatisfy { $0 == "-" || $0 == ":" } && s.contains("-")
+    }
+
+    private func stripMarkdown(_ s: String) -> String {
+        s.replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "**", with: "")
+    }
+
+    /// Render markdown table rows as an aligned grid. Returns the new y below it.
+    private func renderTable(_ ctx: CGContext, rows rawRows: [String], x: Int, y: Int,
+                             w: Int, bottom: Int, accent: CGColor) -> Int {
+        // Parse into cell rows, dropping the separator row and empty edge cells
+        var rows: [[String]] = []
+        for line in rawRows {
+            var cells = line.components(separatedBy: "|").map {
+                stripMarkdown($0.trimmingCharacters(in: .whitespaces))
+            }
+            if cells.first == "" { cells.removeFirst() }
+            if cells.last == "" { cells.removeLast() }
+            if cells.allSatisfy({ isSeparatorCell($0) }) { continue }
+            if !cells.isEmpty { rows.append(cells) }
+        }
+        guard !rows.isEmpty else { return y }
+
+        let cols = rows.map(\.count).max() ?? 1
+        let rowH = 24
+        let colGap = 8
+        let colW = (w - colGap * (cols - 1)) / max(cols, 1)
+        guard colW > 20 else { return y }
+        let cellFont = Fonts.system(16)
+        let headFont = Fonts.system(16, weight: .semibold)
+
+        var cy = y + 2
+        for (ri, row) in rows.enumerated() {
+            if cy + rowH > bottom { break }
+            for ci in 0..<cols {
+                let cell = ci < row.count ? row[ci] : ""
+                if cell.isEmpty { continue }
+                let cx = x + ci * (colW + colGap)
+                let font = ri == 0 ? headFont : cellFont
+                let color = ri == 0 ? accent : Color.textS
+                Draw.text(ctx, truncate(cell, font: font, maxW: CGFloat(colW)),
+                          x: cx, y: cy, font: font, color: color)
+            }
+            cy += rowH
+            if ri == 0 {  // underline under the header row
+                Draw.line(ctx, from: CGPoint(x: x, y: cy - 4),
+                          to: CGPoint(x: x + w, y: cy - 4), color: Color.border)
+            }
+        }
+        return cy + 4
+    }
+
+    /// Truncate a single line with "…" to fit maxW.
+    private func truncate(_ s: String, font: NSFont, maxW: CGFloat) -> String {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        if (s as NSString).size(withAttributes: attrs).width <= maxW { return s }
+        var t = s
+        while !t.isEmpty {
+            t.removeLast()
+            if ((t + "…") as NSString).size(withAttributes: attrs).width <= maxW {
+                return t + "…"
+            }
+        }
+        return "…"
+    }
+
+    /// Greedy character wrap (activity text may be CJK — no word boundaries).
+    private func wrap(_ s: String, font: NSFont, maxW: CGFloat, maxLines: Int) -> [String] {
+        guard maxLines >= 1 else { return [] }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var lines: [String] = []
+        var current = ""
+        for ch in s {
+            let candidate = current + String(ch)
+            if (candidate as NSString).size(withAttributes: attrs).width > maxW {
+                // Reached the last allowed line → fold the whole remainder into it
+                if lines.count == maxLines - 1 {
+                    let rest = String(s[s.index(s.startIndex, offsetBy: lines.joined().count)...])
+                    lines.append(truncate(rest, font: font, maxW: maxW))
+                    return lines
+                }
+                lines.append(current)
+                current = String(ch)
+            } else {
+                current = candidate
+            }
+        }
+        if !current.isEmpty { lines.append(current) }
+        return lines
+    }
+
 }

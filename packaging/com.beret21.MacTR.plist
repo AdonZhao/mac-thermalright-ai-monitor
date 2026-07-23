@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.beret21.MacTR</string>
+
+    <!-- EDIT this to the absolute path of your built binary -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/PATH/TO/MacTR/.build/release/MacTR</string>
+    </array>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Relaunch on crash, but NOT on a clean Quit (menu → Quit exits 0) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/mactr.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mactr.err.log</string>
+</dict>
+</plist>

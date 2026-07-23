@@ -1,0 +1,18 @@
+# Build artifacts
+.build/
+*.o
+*.swiftmodule
+
+# SwiftPM
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+
+# Local / private
+*.log
+img/*.HEIC

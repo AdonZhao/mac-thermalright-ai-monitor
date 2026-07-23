@@ -91,6 +91,11 @@ final class AppState {
     func applySettings() {
         engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
     }
+
+    /// Latest rendered frame for the on-Mac preview window
+    func currentFrame() -> CGImage? {
+        engine?.currentFrame()
+    }
 }
 
 // MARK: - Engine Status
@@ -160,6 +165,12 @@ final class DisplayEngine: @unchecked Sendable {
         }
     }
 
+    /// Latest rendered frame for the on-Mac preview window (used while the LCD
+    /// is disconnected). Thread-safe: render() serializes internally.
+    func currentFrame() -> CGImage? {
+        monitorRenderer.render()
+    }
+
     func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
         log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
         self.currentSet = set
@@ -216,8 +227,13 @@ final class DisplayEngine: @unchecked Sendable {
         var nextDeadline = DispatchTime.now()
 
         while running {
-            // Schedule next frame deadline BEFORE work starts
-            nextDeadline = nextDeadline + .milliseconds(Int(interval * 1000))
+            // Adaptive frame rate: the device sustains ~19fps, but the dashboard's
+            // data only changes every ~2s. Run fast (15fps) ONLY while a column is
+            // animating (agent working → breathing, or done → blinking); otherwise
+            // idle at the configured interval to save CPU/power on this always-on app.
+            let animating = (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
+            let frameInterval = animating ? (1.0 / 15.0) : interval
+            nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
@@ -291,7 +307,8 @@ final class DisplayEngine: @unchecked Sendable {
             guard let self else { return }
             log("[Hotplug] Device removed")
             self.running = false
-            self.monitorRenderer.stopMetrics()
+            // Metrics keep collecting — the on-Mac preview window takes over
+            // rendering while the LCD is away
             self.usbQueue.async { [weak self] in
                 self?.device?.close()
                 self?.device = nil
