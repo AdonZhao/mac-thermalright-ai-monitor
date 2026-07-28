@@ -20,6 +20,23 @@ enum DisplaySet: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 }
 
+// MARK: - Night schedule
+
+/// Nightly window during which the LCD is blanked and the dashboard shows on the
+/// Mac instead. Defaults to 18:30 → 09:00 (spans midnight).
+enum NightSchedule {
+    static let startMinute = 18 * 60 + 30   // 18:30
+    static let endMinute = 9 * 60           // 09:00
+
+    static var isNight: Bool {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        return startMinute < endMinute
+            ? (m >= startMinute && m < endMinute)      // same-day window
+            : (m >= startMinute || m < endMinute)      // window spanning midnight
+    }
+}
+
 // MARK: - AppState
 
 @Observable
@@ -111,6 +128,22 @@ struct EngineStatus: Sendable {
 // MARK: - Display Engine (runs entirely off main thread)
 
 final class DisplayEngine: @unchecked Sendable {
+
+    // Cached all-black JPEG used to blank the LCD during the night window.
+    nonisolated(unsafe) private static var _blackFrame: Data?
+    static func blackFrame(rotate: Bool) -> Data? {
+        if let f = _blackFrame { return f }
+        let w = Layout.width, h = Layout.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        guard let img = ctx.makeImage() else { return nil }
+        _blackFrame = JPEGEncoder.encode(img, brightness: 1, rotate: rotate)
+        return _blackFrame
+    }
 
     private let statusCallback: @Sendable (EngineStatus) -> Void
     private let usbQueue = DispatchQueue(label: "com.thermalvision.usb")
@@ -227,12 +260,16 @@ final class DisplayEngine: @unchecked Sendable {
         var nextDeadline = DispatchTime.now()
 
         while running {
+            // Night window (18:30–09:00): blank the LCD; the dashboard shows on the
+            // Mac preview instead. Refresh the black frame slowly to save power.
+            let night = NightSchedule.isNight
+
             // Adaptive frame rate: the device sustains ~19fps, but the dashboard's
             // data only changes every ~2s. Run fast (15fps) ONLY while a column is
             // animating (agent working → breathing, or done → blinking); otherwise
             // idle at the configured interval to save CPU/power on this always-on app.
-            let animating = (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
-            let frameInterval = animating ? (1.0 / 15.0) : interval
+            let animating = !night && (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
+            let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : interval)
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
@@ -244,12 +281,16 @@ final class DisplayEngine: @unchecked Sendable {
 
                 let jpeg: Data?
 
-                switch set {
-                case .systemMonitor:
-                    if let image = monitorRenderer.render() {
-                        jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
-                    } else {
-                        jpeg = nil
+                if night {
+                    jpeg = DisplayEngine.blackFrame(rotate: rotate)
+                } else {
+                    switch set {
+                    case .systemMonitor:
+                        if let image = monitorRenderer.render() {
+                            jpeg = JPEGEncoder.encode(image, brightness: bright, rotate: rotate)
+                        } else {
+                            jpeg = nil
+                        }
                     }
                 }
 

@@ -7,10 +7,9 @@
 
 import AppKit
 import os
-import Sparkle
 import SwiftUI
 
-private let mactrLogger = Logger(subsystem: "com.beret21.MacTR", category: "main")
+private let mactrLogger = Logger(subsystem: "com.m1ngli.MacTRAI", category: "main")
 
 func log(_ message: String) {
     mactrLogger.info("\(message, privacy: .public)")
@@ -161,17 +160,13 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let appState = AppState()
     private var menu: NSMenu!
 
-    // On-Mac preview — shown automatically while the LCD is disconnected
+    // On-Mac preview — shown automatically while the LCD is disconnected OR during
+    // the nightly window (18:30–09:00, when the LCD is blanked). `previewShown`
+    // tracks our intent so the timer doesn't re-open / re-focus it every tick.
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
     private var previewTimer: Timer?
-
-    // Sparkle auto-updater — only start when running from a real .app bundle;
-    // a bare `swift build` binary has no Info.plist for Sparkle to work with
-    private let updaterController = SPUStandardUpdaterController(
-        startingUpdater: Bundle.main.bundleIdentifier != nil
-            && Bundle.main.bundlePath.hasSuffix(".app"),
-        updaterDelegate: nil, userDriverDelegate: nil)
+    private var previewShown = false
 
     // Menu items that need updating
     private var statusMenuItem: NSMenuItem!
@@ -198,7 +193,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         ) { [weak self] _ in
             self?.updateIcon()
             self?.updateMenuItems()
-            self?.updatePreviewForConnection()
+            self?.updateDisplayTarget()
         }
 
         // Start engine
@@ -207,14 +202,15 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         // No LCD after the initial connect attempt → fall back to on-Mac preview.
         // Delayed so a present device can connect first without a window flash.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.updatePreviewForConnection()
+            self?.updateDisplayTarget()
         }
 
-        // Timer to refresh menu + icon
+        // Timer to refresh menu + icon, and to react to the night-window schedule
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updateIcon()
                 self?.updateMenuItems()
+                self?.updateDisplayTarget()
             }
         }
     }
@@ -339,16 +335,8 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         menu.addItem(.separator())
 
-        // Check for Updates
-        let checkUpdatesItem = NSMenuItem(
-            title: "Check for Updates...",
-            action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-            keyEquivalent: "u")
-        checkUpdatesItem.target = updaterController
-        menu.addItem(checkUpdatesItem)
-
         // About
-        let aboutItem = NSMenuItem(title: "About MacTR", action: #selector(showAbout), keyEquivalent: "")
+        let aboutItem = NSMenuItem(title: "About MacTR AI", action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
 
@@ -373,11 +361,15 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     // MARK: - Preview Window (auto-fallback when LCD is disconnected)
 
-    private func updatePreviewForConnection() {
-        if appState.isConnected {
-            hidePreview()
-        } else {
-            showPreview()
+    /// Show the dashboard on the Mac when the LCD isn't the right target:
+    /// either it's disconnected, or we're inside the night window (LCD blanked).
+    /// Transition-based so we don't grab focus every second.
+    private func updateDisplayTarget() {
+        let wantPreview = !appState.isConnected || NightSchedule.isNight
+        if wantPreview && !previewShown {
+            showPreview(); previewShown = true
+        } else if !wantPreview && previewShown {
+            hidePreview(); previewShown = false
         }
     }
 
@@ -388,7 +380,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
                 contentRect: NSRect(origin: .zero, size: contentSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered, defer: false)
-            window.title = "MacTR — LCD 未连接，本机预览中"
+            window.title = "MacTR — 本机预览"
             window.contentAspectRatio = NSSize(width: Layout.width, height: Layout.height)
             window.isReleasedWhenClosed = false
             window.delegate = self
@@ -402,8 +394,8 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             previewWindow = window
             previewImageView = imageView
         }
-        previewWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // orderFrontRegardless shows it without stealing focus from your work
+        previewWindow?.orderFrontRegardless()
 
         if previewTimer == nil {
             // 10fps for smooth breathing/blink (metrics are cached, recomputed ~2s)
@@ -427,11 +419,12 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func showPreviewManually() {
-        showPreview()
+        showPreview(); previewShown = true
     }
 
-    // User closed the preview window — stop rendering to it; reopen via the
-    // menu (⌘P) or automatically on the next connect/disconnect transition
+    // User closed the preview window — stop rendering to it. previewShown stays true
+    // so we don't immediately reopen it; it comes back on the next display-target
+    // transition (LCD unplug, or entering/leaving the night window).
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == previewWindow else { return }
         previewTimer?.invalidate()
@@ -462,16 +455,17 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
 
         let alert = NSAlert()
-        alert.messageText = "MacTR"
+        alert.messageText = "MacTR AI"
         alert.informativeText = """
             Version \(version) (Build \(build))
 
-            Mac + Thermalright
-            Native macOS driver for Thermalright
-            Trofeo Vision 9.16 LCD display.
+            AI agent + system monitor for the
+            Thermalright Trofeo Vision 9.16 LCD.
 
             Built with Swift + libusb
-            github.com/beret21/MacTR
+            github.com/m1ng-li/mac-thermalright-ai-monitor
+
+            Based on beret21/MacTR
             """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
