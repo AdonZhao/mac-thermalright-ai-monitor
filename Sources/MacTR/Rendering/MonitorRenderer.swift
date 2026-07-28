@@ -45,7 +45,10 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                    project: u.project, activity: u.activity,
                    quotaUsedPercent: u.quotaUsedPercent,
                    quotaResetsAt: u.quotaResetsAt,
-                   needsAttention: true)
+                   needsAttention: true,
+                   waitingFor: u.waitingFor, model: u.model,
+                   stepCurrent: u.stepCurrent, stepTotal: u.stepTotal,
+                   stepText: u.stepText)
     }
 
     /// Start background metrics collection. Call before first render().
@@ -100,23 +103,30 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         log("[Metrics] Loop started on metricsQueue")
         var slowTick = 0
         while metricsRunning {
-            // Fast metrics every tick
-            let cpu = collector.collectCPU()
-            let mem = collector.collectMemory()
-            lock.lock()
-            _cpu = cpu; _mem = mem
-            lock.unlock()
-
-            // Slow metrics every 4th tick (~2s)
-            slowTick += 1
-            if slowTick >= 4 {
-                let temp = collector.collectTemperature()
-                let agents = agentCollector.collect()
-                let sys = collector.collectSystem()
+            // This loop is a single never-returning GCD work item, so its implicit
+            // autorelease pool is never drained. Everything autoreleased below —
+            // JSONSerialization's NSDictionary/CFString graphs, attributesOfItem
+            // dictionaries, FileHandle's NSData buffers — would accumulate for the
+            // life of the process (~2GB/hour). Drain it every tick.
+            autoreleasepool {
+                // Fast metrics every tick
+                let cpu = collector.collectCPU()
+                let mem = collector.collectMemory()
                 lock.lock()
-                _temp = temp; _agents = agents; _sys = sys
+                _cpu = cpu; _mem = mem
                 lock.unlock()
-                slowTick = 0
+
+                // Slow metrics every 4th tick (~2s)
+                slowTick += 1
+                if slowTick >= 4 {
+                    let temp = collector.collectTemperature()
+                    let agents = agentCollector.collect()
+                    let sys = collector.collectSystem()
+                    lock.lock()
+                    _temp = temp; _agents = agents; _sys = sys
+                    lock.unlock()
+                    slowTick = 0
+                }
             }
 
             Thread.sleep(forTimeInterval: 0.5)
@@ -262,6 +272,42 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let image = ctx.makeImage()
         ctx.restoreGState()
         return image
+    }
+
+    /// Model id → a compact label that fits the header.
+    ///   claude-opus-5              → Opus 5
+    ///   claude-haiku-4-5-20251001  → Haiku 4.5
+    ///   bapi_codex/gpt-5.6-sol     → GPT-5.6-sol
+    /// Anything unrecognised falls through as-is (minus the provider prefix), so a
+    /// new model shows up as its raw id rather than disappearing.
+    private func shortModel(_ id: String) -> String {
+        // Strip a provider prefix like "bapi_codex/"
+        let bare = id.contains("/") ? String(id.split(separator: "/").last!) : id
+
+        if bare.hasPrefix("claude-") {
+            var parts = bare.dropFirst("claude-".count).split(separator: "-").map(String.init)
+            // Drop a trailing yyyymmdd snapshot stamp
+            if let last = parts.last, last.count == 8, Int(last) != nil { parts.removeLast() }
+            guard let family = parts.first else { return bare }
+            let version = parts.dropFirst().joined(separator: ".")
+            let name = family.prefix(1).uppercased() + family.dropFirst()
+            return version.isEmpty ? name : "\(name) \(version)"
+        }
+        if bare.hasPrefix("gpt-") { return "GPT-" + bare.dropFirst(4) }
+        return bare
+    }
+
+    /// Claude Code's `waitingFor` reason → a short label matching the panel's
+    /// other Chinese captions. Unknown reasons pass through as-is.
+    private func waitingLabel(_ reason: String) -> String {
+        switch reason {
+        case "permission prompt": return "待授权"
+        case "input needed":      return "待输入"
+        case "dialog open":       return "待确认"
+        case "sandbox request":   return "沙箱授权"
+        case "worker request":    return "子进程请求"
+        default:                  return reason
+        }
     }
 
     // MARK: - CPU Panel
@@ -673,6 +719,45 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ctx.fillEllipse(in: CGRect(x: CGFloat(x + w) - agoW - dotR * 2 - 8,
                                    y: CGFloat(py + 56) + 10 - dotR,
                                    width: dotR * 2, height: dotR * 2))
+
+        // Header extras, laid out left to right after the column name: the active
+        // model, then the blocked-on-you badge. A shared cursor keeps them from
+        // overlapping, and each is dropped rather than drawn if it would run into
+        // the right-aligned ago text.
+        let nameW = (name as NSString)
+            .size(withAttributes: [.font: Fonts.system(24, weight: .bold)]).width
+        var cursor = CGFloat(x) + nameW + 14
+        let rightLimit = CGFloat(x + w) - agoW - 24
+
+        if let id = usage.model {
+            let label = shortModel(id)
+            let mFont = Fonts.system(16, weight: .medium)
+            let mW = (label as NSString).size(withAttributes: [.font: mFont]).width
+            if cursor + mW < rightLimit {
+                Draw.text(ctx, label, x: Int(cursor), y: py + 56,
+                          font: mFont, color: Color.textL)
+                cursor += mW + 12
+            }
+        }
+
+        // Solid amber so the badge stays legible through the attention blink.
+        if let reason = usage.waitingFor {
+            let label = waitingLabel(reason)
+            let bFont = Fonts.system(16, weight: .bold)
+            let bW = (label as NSString).size(withAttributes: [.font: bFont]).width
+            let padX: CGFloat = 9, padY: CGFloat = 4
+            let by = CGFloat(py + 50) + 3
+            if cursor + bW + padX * 2 < rightLimit {
+                let pill = CGRect(x: cursor, y: by, width: bW + padX * 2,
+                                  height: bFont.pointSize + padY * 2)
+                ctx.setFillColor(Color.orange)
+                ctx.addPath(CGPath(roundedRect: pill, cornerWidth: 5, cornerHeight: 5,
+                                   transform: nil))
+                ctx.fillPath()
+                Draw.text(ctx, label, x: Int(cursor + padX), y: Int(by + padY - 1),
+                          font: bFont, color: Color.bgTop)
+            }
+        }
 
         // Current session — TOP. Project (+ step badge), plan progress, live activity.
         var y = py + 90
