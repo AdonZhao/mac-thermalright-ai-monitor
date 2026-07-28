@@ -191,9 +191,17 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         NotificationCenter.default.addObserver(
             forName: .deviceStateChanged, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.updateIcon()
-            self?.updateMenuItems()
-            self?.updateDisplayTarget()
+            // `queue: .main` already guarantees this body runs on the main thread,
+            // but the observer closure's type is nonisolated, so the compiler has
+            // no way to see that. Assert it rather than hopping through
+            // `Task { @MainActor }` — the point of this observer is to repaint the
+            // icon the instant the device state flips, and a hop would let a frame
+            // render against the stale state first.
+            MainActor.assumeIsolated {
+                self?.updateIcon()
+                self?.updateMenuItems()
+                self?.updateDisplayTarget()
+            }
         }
 
         // Start engine
