@@ -15,7 +15,7 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install native deps
         run: brew install libusb pkg-config
@@ -48,7 +48,7 @@ jobs:
           "dist/MacTR AI.app/Contents/MacOS/MacTR" --snapshot /tmp/frame.png --cores 10
           test -s /tmp/frame.png
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: MacTR-AI-dmg
           path: dist/*.dmg
