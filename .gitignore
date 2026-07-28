@@ -3,6 +3,10 @@
 *.o
 *.swiftmodule
 
+# Packaging output (packaging/build-app.sh, packaging/make-dmg.sh)
+dist/
+packaging/AppIcon.iconset/
+
 # SwiftPM
 Package.resolved
 

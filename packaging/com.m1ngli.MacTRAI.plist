@@ -1,14 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional. The app has a "Launch at login" switch in Settings (SMAppService),
+  which is simpler and needs no file here.
+
+  Use this LaunchAgent instead when you want the one thing SMAppService does not
+  do: KeepAlive, i.e. relaunch the app if it ever crashes.
+
+    cp packaging/com.m1ngli.MacTRAI.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.m1ngli.MacTRAI.plist
+
+  Turn the in-app "Launch at login" switch OFF if you use this, or the app gets
+  started twice and the two copies fight over the USB device.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.beret21.MacTR</string>
+    <string>com.m1ngli.MacTRAI</string>
 
-    <!-- EDIT this to the absolute path of your built binary -->
+    <!-- Assumes the app was installed from the .dmg into /Applications. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/REPLACE/WITH/PATH/TO/MacTR/.build/release/MacTR</string>
+        <string>/Applications/MacTR AI.app/Contents/MacOS/MacTR</string>
     </array>
 
     <!-- Start at login -->

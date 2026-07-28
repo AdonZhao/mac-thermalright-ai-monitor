@@ -1,0 +1,55 @@
+name: Build
+
+# Validates that the app still packages cleanly with the stock Xcode toolchain.
+# Worth running on every push: local builds here often use the Homebrew Swift
+# (the usual workaround for a broken Command Line Tools install), so CI is the
+# only place the toolchain that actually ships the release gets exercised.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native deps
+        run: brew install libusb pkg-config
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build .app
+        run: ./packaging/build-app.sh
+
+      - name: Build .dmg
+        run: ./packaging/make-dmg.sh
+
+      # A bundle that references the runner's /opt/homebrew would launch here and
+      # die on a user's machine, so assert the linkage rather than trusting it.
+      - name: Assert no machine-local dylib references
+        run: |
+          leaked=$(otool -L "dist/MacTR AI.app/Contents/MacOS/MacTR" \
+            | tail -n +2 | awk '{print $1}' \
+            | grep -Ev '^(/System/|/usr/lib/|@rpath/|@executable_path/|@loader_path/)' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::bundle references machine-local dylibs:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "clean"
+
+      - name: Smoke test
+        run: |
+          "dist/MacTR AI.app/Contents/MacOS/MacTR" --snapshot /tmp/frame.png --cores 10
+          test -s /tmp/frame.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MacTR-AI-dmg
+          path: dist/*.dmg
+          retention-days: 14

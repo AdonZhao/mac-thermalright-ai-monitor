@@ -3,30 +3,28 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
+	<string>MacTR AI</string>
+	<key>CFBundleExecutable</key>
 	<string>MacTR</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.beret21.MacTR</string>
+	<string>com.m1ngli.MacTRAI</string>
 	<key>CFBundleName</key>
-	<string>MacTR</string>
+	<string>MacTR AI</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.3.11</string>
+	<string>2.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.3.11</string>
+	<string>2.0.0</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<string>15.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>SUEnableAutomaticChecks</key>
-	<true/>
-	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/beret21/MacTR/main/appcast.xml</string>
-	<key>SUPublicEDKey</key>
-	<string>cFBwTLEG3a+RMA0SIGpWpITuHaaeg7qPKeZXnOh5R64=</string>
-	<key>SUScheduledCheckInterval</key>
-	<integer>86400</integer>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License. Based on beret21/MacTR.</string>
 </dict>
 </plist>

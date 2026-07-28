@@ -1,0 +1,96 @@
+name: Release
+
+# Tag-triggered release:  git tag v2.0.0 && git push origin v2.0.0
+#
+# The bundle version is stamped from the tag, so the tag is the single source of
+# truth and Info.plist never has to be kept in sync by hand.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native deps
+        run: brew install libusb pkg-config
+
+      - name: Derive version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build .app
+        env:
+          MACTR_VERSION: ${{ steps.v.outputs.version }}
+        run: ./packaging/build-app.sh
+
+      - name: Build .dmg
+        env:
+          MACTR_VERSION: ${{ steps.v.outputs.version }}
+        run: ./packaging/make-dmg.sh
+
+      - name: Assert no machine-local dylib references
+        run: |
+          leaked=$(otool -L "dist/MacTR AI.app/Contents/MacOS/MacTR" \
+            | tail -n +2 | awk '{print $1}' \
+            | grep -Ev '^(/System/|/usr/lib/|@rpath/|@executable_path/|@loader_path/)' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::bundle references machine-local dylibs:"
+            echo "$leaked"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          "dist/MacTR AI.app/Contents/MacOS/MacTR" --snapshot /tmp/frame.png --cores 10
+          test -s /tmp/frame.png
+
+      - name: Compose release notes
+        id: notes
+        run: |
+          DMG=$(ls dist/*.dmg)
+          SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+          {
+            echo "## 安装"
+            echo
+            echo '下载下面的 `.dmg`，打开后把 **MacTR AI** 拖进「应用程序」。'
+            echo
+            echo '> **首次打开会被 Gatekeeper 拦住。** 这个 App 没有花钱买 Apple 开发者证书，'
+            echo '> 只做了 ad-hoc 签名，所以 macOS 会说「无法验证开发者」。'
+            echo '> 在「应用程序」里 **右键点图标 → 打开**，再点一次「打开」即可；只需做一次。'
+            echo '>'
+            echo '> 或者在终端里执行：'
+            echo '> ```'
+            echo '> xattr -dr com.apple.quarantine "/Applications/MacTR AI.app"'
+            echo '> ```'
+            echo
+            echo "## 要求"
+            echo
+            echo '- Apple Silicon Mac，macOS 15 或更新'
+            echo '- 利民 Trofeo Vision 9.16 LCD（没有屏也能跑，会在电脑上开预览窗口）'
+            echo '- 不需要装 Homebrew —— libusb 已经打进 App 里了'
+            echo
+            echo "## 校验"
+            echo
+            echo '```'
+            echo "sha256  $SHA"
+            echo "        $(basename "$DMG")"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.dmg \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes

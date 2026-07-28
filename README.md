@@ -54,10 +54,28 @@
 
 - Apple Silicon Mac(M1–M5)
 - macOS 15(Sequoia)或更新
-- [Homebrew](https://brew.sh) 并安装 `libusb`
-- 较新的 Swift 工具链(Xcode 16+,或经 Homebrew 的 Swift 6.1+)
 
-## 构建与运行
+下载安装包的话到此为止 —— libusb 已经打进 App 里,不需要装 Homebrew。
+只有想从源码构建时才另外需要 `libusb` 和 Swift 6.1+ 工具链。
+
+## 安装
+
+从 [Releases](https://github.com/m1ng-li/mac-thermalright-ai-monitor/releases)
+下载 `.dmg`,打开后把 **MacTR AI** 拖进「应用程序」。
+
+> **首次打开会被 Gatekeeper 拦下。** 这个 App 没买 Apple 开发者证书(99 美元/年),
+> 只做了 ad-hoc 签名,所以 macOS 会说「无法验证开发者」。
+> 在「应用程序」里 **右键点图标 → 打开**,弹窗里再点一次「打开」就行,只需一次。
+>
+> 命令行等价写法:
+>
+> ```bash
+> xattr -dr com.apple.quarantine "/Applications/MacTR AI.app"
+> ```
+
+装好后从菜单栏图标进入设置,可以打开「开机自启」。
+
+## 从源码构建
 
 ```bash
 brew install libusb pkg-config
@@ -71,14 +89,34 @@ swift build -c release
 
 > 如果系统的 Command Line Tools 损坏、`swift build` 在解析包清单时报错,
 > 装 Homebrew 的 Swift 工具链(`brew install swift`),改用
-> `/opt/homebrew/opt/swift/bin/swift build -c release`。
+> `/opt/homebrew/opt/swift/bin/swift build -c release`,
+> 或给下面的打包脚本传 `SWIFT=/opt/homebrew/opt/swift/bin/swift`。
+
+### 自己打包成 .app / .dmg
+
+```bash
+./packaging/build-app.sh      # → dist/MacTR AI.app(自带 libusb,已 ad-hoc 签名)
+./packaging/make-dmg.sh       # → dist/MacTR-AI-<版本>-arm64.dmg
+```
+
+`build-app.sh` 会自动把二进制引用的所有非系统 dylib 复制进 `Contents/Frameworks`
+并改写 install name,最后校验产物里没有残留构建机的本地路径。
+
+版本号以 git tag 为准:推一个 `v*` tag 就会触发
+[Release 流水线](.github/workflows/release.yml),由 CI 构建并把 DMG 传到 GitHub Release。
 
 ### 开机(登录)自启
 
+推荐用 App 内设置里的开关(基于 `SMAppService`)。
+
+如果你还想要「崩溃后自动拉起」,改用 LaunchAgent:
+
 ```bash
-cp packaging/com.beret21.MacTR.plist ~/Library/LaunchAgents/   # 先改里面的路径
-launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
+cp packaging/com.m1ngli.MacTRAI.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.m1ngli.MacTRAI.plist
 ```
+
+两者只能选一个,同时开会启动两份实例互抢 USB 设备。
 
 ## 运行模式
 
@@ -90,6 +128,8 @@ launchctl load -w ~/Library/LaunchAgents/com.beret21.MacTR.plist
 .build/release/MacTR --gif x.gif --frames 48 --fps 12 --scale 2   # 生成演示 GIF
 .build/release/MacTR --benchmark 120 # 测量 LCD 可达帧率
 ```
+
+装好的 App 里同样的入口是 `/Applications/MacTR AI.app/Contents/MacOS/MacTR`。
 
 同一时刻只能有一个进程占用 USB 设备 —— 用 `--demo` / `--benchmark` 前先停掉正在运行的实例。
 
