@@ -886,26 +886,47 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let proseFont = Fonts.system(19)
         let lineH = 26
         var cy = y
+        // Trim once up front: this runs every frame, and the loop below used to
+        // re-trim the same lines several times over.
         let raw = text.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+
+        // reserve[j] = lines the blocks from j onward need at minimum, so a long
+        // paragraph can be told how much room it must leave for its successors.
+        // Table rows want one line each; anything else gets the 2-line floor every
+        // prose block is guaranteed. Computed as a suffix sum so the layout stays
+        // linear in the number of lines.
+        var reserve = [Int](repeating: 0, count: raw.count + 1)
+        for j in stride(from: raw.count - 1, through: 0, by: -1) {
+            let cost = raw[j].isEmpty ? 0 : (isTableLine(raw[j]) ? 1 : 2)
+            reserve[j] = reserve[j + 1] + cost
+        }
+
         var i = 0
         while i < raw.count && cy + 20 <= bottom {
-            let line = raw[i].trimmingCharacters(in: .whitespaces)
+            let line = raw[i]
             if line.isEmpty { i += 1; continue }
 
             if isTableLine(line) {
                 // Consume the contiguous run of table rows and render as a grid
                 var block: [String] = []
-                while i < raw.count && isTableLine(raw[i].trimmingCharacters(in: .whitespaces)) {
-                    block.append(raw[i].trimmingCharacters(in: .whitespaces))
+                while i < raw.count && isTableLine(raw[i]) {
+                    block.append(raw[i])
                     i += 1
                 }
                 cy = renderTable(ctx, rows: block, x: x, y: cy, w: w, bottom: bottom, accent: accent)
             } else {
-                // Prose / bullet — wrap, but cap each block so a table below still fits
+                // Prose / bullet — wrap, capped so this block cannot crowd out what
+                // follows (typically a markdown table). Budget against what actually
+                // comes next rather than a flat 2 lines: an agent mid-turn usually
+                // writes one long unbroken paragraph, and the flat cap rendered two
+                // lines of it and left the rest of the column blank. With nothing
+                // after it, a paragraph may use the whole panel.
                 let remaining = (bottom - cy) / lineH
                 guard remaining > 0 else { break }
+                let cap = max(2, remaining - reserve[i + 1])
                 let wrapped = wrap(stripMarkdown(line), font: proseFont,
-                                   maxW: CGFloat(w), maxLines: min(2, remaining))
+                                   maxW: CGFloat(w), maxLines: min(cap, remaining))
                 for wl in wrapped {
                     if cy + lineH > bottom { break }
                     Draw.text(ctx, wl, x: x, y: cy, font: proseFont, color: Color.textS)
