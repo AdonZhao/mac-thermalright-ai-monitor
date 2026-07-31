@@ -17,7 +17,7 @@ func emptyStoreYieldsDefaults() throws {
 func savedSettingsRoundTrip() throws {
     try withThrowawayStore { store in
         let prefs = Preferences(store: store)
-        let settings = DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0)
+        let settings = DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0, night: .default)
         prefs.save(settings)
         #expect(prefs.load() == settings)
     }
@@ -53,7 +53,7 @@ func everyOfferedIntervalRoundTrips() throws {
         let prefs = Preferences(store: store)
         for choice in Preferences.refreshIntervalChoices {
             prefs.save(DisplaySettings(
-                rotateDisplay: false, brightness: 5, refreshInterval: choice.seconds))
+                rotateDisplay: false, brightness: 5, refreshInterval: choice.seconds, night: .default))
             #expect(prefs.load().refreshInterval == choice.seconds,
                     "\(choice.label) did not survive")
         }
@@ -71,7 +71,34 @@ func legacyKeysAreStillRead() throws {
         store.set(2.0, forKey: Preferences.LegacyKey.refreshInterval)
 
         #expect(Preferences(store: store).load()
-            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0))
+            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0, night: .default))
+    }
+}
+
+@Test("the night schedule survives a round trip, switched off included")
+func nightScheduleRoundTrips() throws {
+    try withThrowawayStore { store in
+        let prefs = Preferences(store: store)
+        var settings = DisplaySettings.default
+        settings.night = NightSchedule(enabled: false, startMinute: 20 * 60, endMinute: 7 * 60)
+
+        prefs.save(settings)
+
+        #expect(prefs.load().night == settings.night)
+    }
+}
+
+/// A time of day outside the day was never a time, so there is no nearer one to
+/// honour — unlike brightness, which clamps.
+@Test("an out-of-day night time falls back to the default")
+func outOfRangeNightTimeFallsBack() throws {
+    try withThrowawayStore { store in
+        store.set(24 * 60, forKey: Preferences.Key.nightStartMinute)   // 24:00 is not a time
+        store.set(-30, forKey: Preferences.Key.nightEndMinute)
+
+        let night = Preferences(store: store).load().night
+        #expect(night.startMinute == NightSchedule.default.startMinute)
+        #expect(night.endMinute == NightSchedule.default.endMinute)
     }
 }
 

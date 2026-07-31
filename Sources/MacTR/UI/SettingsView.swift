@@ -103,6 +103,23 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Night") {
+                Toggle("Blank the LCD overnight", isOn: $state.night.enabled)
+                    .onChange(of: state.night.enabled) {
+                        state.applySettings()
+                    }
+
+                DatePicker("From", selection: nightStart, displayedComponents: .hourAndMinute)
+                    .disabled(!state.night.enabled)
+                DatePicker("Until", selection: nightEnd, displayedComponents: .hourAndMinute)
+                    .disabled(!state.night.enabled)
+
+                Text("The dashboard moves to a window on the Mac while the LCD is dark. "
+                    + "Setting both times the same leaves it on.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .padding()
@@ -195,5 +212,33 @@ struct SettingsView: View {
             get: { Double(state.brightness) },
             set: { state.brightness = Int($0) }
         )
+    }
+
+    // DatePicker speaks Date; the schedule stores minutes since midnight, because
+    // a window like 18:30→09:00 has to be comparable without dragging a calendar
+    // date into it. These bind the two, and save on every edit — the pickers have
+    // no discrete "committed" moment to hang an onChange on.
+    private var nightStart: Binding<Date> { nightTime(\.startMinute) }
+    private var nightEnd: Binding<Date> { nightTime(\.endMinute) }
+
+    private func nightTime(_ minute: WritableKeyPath<NightSchedule, Int>) -> Binding<Date> {
+        Binding(
+            get: { Self.time(atMinute: state.night[keyPath: minute]) },
+            set: {
+                state.night[keyPath: minute] = Self.minuteOfDay(of: $0)
+                state.applySettings()
+            }
+        )
+    }
+
+    /// Today at `m` minutes past midnight — only the time is ever read back out.
+    private static func time(atMinute m: Int) -> Date {
+        Calendar.current.date(
+            bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
+    }
+
+    private static func minuteOfDay(of date: Date) -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 }

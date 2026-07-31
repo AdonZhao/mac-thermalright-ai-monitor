@@ -10,7 +10,7 @@ import Testing
 func appStateLoadsSavedSettings() throws {
     try withThrowawayStore { store in
         Preferences(store: store).save(
-            DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 1.0))
+            DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 1.0, night: .default))
 
         let state = AppState(preferences: Preferences(store: store))
 
@@ -32,6 +32,6 @@ func applySettingsPersists() throws {
         state.applySettings()
 
         #expect(prefs.load()
-            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 0.5))
+            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 0.5, night: .default))
     }
 }

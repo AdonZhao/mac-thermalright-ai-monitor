@@ -161,7 +161,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var menu: NSMenu!
 
     // On-Mac preview — shown automatically while the LCD is disconnected OR during
-    // the nightly window (18:30–09:00, when the LCD is blanked). `previewShown`
+    // the user's night window, when the LCD is blanked. `previewShown`
     // tracks our intent so the timer doesn't re-open / re-focus it every tick.
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
@@ -383,7 +383,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// answered. The same held for every wake-from-sleep reconnect.
     private func updateDisplayTarget() {
         let noPanel = !appState.isConnected && !appState.isConnecting
-        let wantPreview = noPanel || NightSchedule.isNight
+        let wantPreview = noPanel || appState.night.isNight
         if wantPreview && !previewShown {
             showPreview(); previewShown = true
         } else if !wantPreview && previewShown {
