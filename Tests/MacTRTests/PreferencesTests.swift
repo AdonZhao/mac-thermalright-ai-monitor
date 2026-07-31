@@ -42,3 +42,45 @@ func unsupportedIntervalFallsBack() throws {
             == DisplaySettings.default.refreshInterval)
     }
 }
+
+/// The picker and the validator read the same list, so this holds by
+/// construction — which is the point. It fails the moment someone reintroduces a
+/// second hardcoded list of options, the mistake that would silently reset a
+/// user's choice at the next launch.
+@Test("every interval the picker offers survives a round trip")
+func everyOfferedIntervalRoundTrips() throws {
+    try withThrowawayStore { store in
+        let prefs = Preferences(store: store)
+        for choice in Preferences.refreshIntervalChoices {
+            prefs.save(DisplaySettings(
+                rotateDisplay: false, brightness: 5, refreshInterval: choice.seconds))
+            #expect(prefs.load().refreshInterval == choice.seconds,
+                    "\(choice.label) did not survive")
+        }
+    }
+}
+
+/// Settings written before the keys gained their `display.` prefix must still be
+/// honoured — this app only just learned to remember them, so dropping them on
+/// the very next upgrade would undo the point.
+@Test("settings stored under the pre-prefix keys are still read")
+func legacyKeysAreStillRead() throws {
+    try withThrowawayStore { store in
+        store.set(true, forKey: Preferences.LegacyKey.rotateDisplay)
+        store.set(8, forKey: Preferences.LegacyKey.brightness)
+        store.set(2.0, forKey: Preferences.LegacyKey.refreshInterval)
+
+        #expect(Preferences(store: store).load()
+            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0))
+    }
+}
+
+@Test("a current key wins over a leftover legacy key")
+func currentKeyWinsOverLegacy() throws {
+    try withThrowawayStore { store in
+        store.set(3, forKey: Preferences.LegacyKey.brightness)
+        store.set(9, forKey: Preferences.Key.brightness)
+
+        #expect(Preferences(store: store).load().brightness == 9)
+    }
+}

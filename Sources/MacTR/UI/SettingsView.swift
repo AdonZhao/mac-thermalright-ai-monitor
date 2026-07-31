@@ -46,10 +46,12 @@ struct SettingsView: View {
             }
 
             Section("Refresh") {
+                // Built from Preferences' own list: an option offered here is
+                // therefore always one load() will accept back.
                 Picker("Interval", selection: $state.refreshInterval) {
-                    Text("0.5s (default)").tag(0.5)
-                    Text("1.0s").tag(1.0)
-                    Text("2.0s").tag(2.0)
+                    ForEach(Preferences.refreshIntervalChoices) { choice in
+                        Text(choice.label).tag(choice.seconds)
+                    }
                 }
                 .onChange(of: state.refreshInterval) {
                     state.applySettings()
@@ -77,7 +79,7 @@ struct SettingsView: View {
 
             Section("Brightness") {
                 HStack {
-                    Slider(value: brightnessBinding, in: 1...10, step: 1) {
+                    Slider(value: brightnessBinding, in: Preferences.brightnessBounds, step: 1) {
                         Text("Level")
                     }
                     Text("\(state.brightness)")
