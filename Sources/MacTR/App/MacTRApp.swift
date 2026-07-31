@@ -721,7 +721,8 @@ private func runCLI() {
     }
 
     if isTest {
-        guard let jpeg = makeTestJPEG(width: info.width, height: info.height) else {
+        guard let jpeg = makeTestJPEG(width: info.width, height: info.height,
+                                      rotate: rotate) else {
             log("[ERROR] Failed to create test image")
             return
         }
@@ -783,7 +784,7 @@ private func parseFlag(_ args: [String], flag: String) -> Int? {
 
 // MARK: - Test Image
 
-func makeTestJPEG(width: Int, height: Int) -> Data? {
+func makeTestJPEG(width: Int, height: Int, rotate: Bool = false) -> Data? {
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(
         data: nil, width: width, height: height,
@@ -830,5 +831,5 @@ func makeTestJPEG(width: Int, height: Int) -> Data? {
     ctx.restoreGState()
 
     guard let image = ctx.makeImage() else { return nil }
-    return JPEGEncoder.encode(image)
+    return JPEGEncoder.encode(image, rotate: rotate)
 }
