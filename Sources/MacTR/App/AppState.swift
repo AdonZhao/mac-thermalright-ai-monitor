@@ -149,9 +149,15 @@ struct EngineStatus: Sendable {
 
 final class DisplayEngine: @unchecked Sendable {
 
-    // Cached all-black JPEG used to blank the LCD during the night window.
+    /// Cached all-black JPEG used to blank the LCD during the night window.
+    ///
+    /// Takes no rotation argument on purpose: an all-black frame turned 180° is
+    /// the same frame, so one cached copy serves both orientations. It used to
+    /// take a `rotate:` flag that only the first call could influence — the
+    /// cache short-circuits every call after it — which is the same species of
+    /// lying parameter as the encode flag this file's history is about.
     nonisolated(unsafe) private static var _blackFrame: Data?
-    static func blackFrame(rotate: Bool) -> Data? {
+    static func blackFrame() -> Data? {
         if let f = _blackFrame { return f }
         let w = Layout.width, h = Layout.height
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
@@ -161,7 +167,7 @@ final class DisplayEngine: @unchecked Sendable {
         ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         guard let img = ctx.makeImage() else { return nil }
-        _blackFrame = JPEGEncoder.encode(img, brightness: 1, rotate: rotate)
+        _blackFrame = JPEGEncoder.encode(img, brightness: 1)
         return _blackFrame
     }
 
@@ -173,11 +179,14 @@ final class DisplayEngine: @unchecked Sendable {
     private var frameCount = 0
     private var lastFrameSize = 0
 
-    // Settings (atomically accessed)
+    // Settings (atomically accessed). The three that come from Preferences seed
+    // themselves from DisplaySettings.default rather than repeating its values,
+    // so "what does a fresh install look like" has one answer. In practice
+    // start() overwrites all of them before the render loop can read one.
     private var currentSet: DisplaySet = .systemMonitor
-    private var brightness: Int = 5
-    private var interval: Double = 0.5
-    private var rotateDisplay: Bool = false
+    private var brightness = DisplaySettings.default.brightness
+    private var interval = DisplaySettings.default.refreshInterval
+    private var rotateDisplay = DisplaySettings.default.rotateDisplay
 
     // Renderers
     private let monitorRenderer = MonitorRenderer()
@@ -302,7 +311,7 @@ final class DisplayEngine: @unchecked Sendable {
                 let jpeg: Data?
 
                 if night {
-                    jpeg = DisplayEngine.blackFrame(rotate: rotate)
+                    jpeg = DisplayEngine.blackFrame()
                 } else {
                     switch set {
                     case .systemMonitor:
