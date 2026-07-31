@@ -36,5 +36,13 @@ let package = Package(
                 .linkedLibrary("usb-1.0"),
             ]
         ),
+        .testTarget(
+            name: "MacTRTests",
+            dependencies: ["MacTR"],
+            path: "Tests/MacTRTests",
+            swiftSettings: [
+                .unsafeFlags(["-I/opt/homebrew/include/libusb-1.0"]),
+            ]
+        ),
     ]
 )

@@ -27,7 +27,8 @@ struct SettingsView: View {
                 aboutView
             }
         }
-        .frame(width: 480, height: 340)
+        .padding(.top, 12)
+        .frame(width: 480, height: 460)
     }
 
     // MARK: - General Tab

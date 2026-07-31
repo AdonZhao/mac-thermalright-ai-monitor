@@ -452,7 +452,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let window = NSWindow(contentViewController: hostingController)
         window.title = "MacTR Settings"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 450, height: 350))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
