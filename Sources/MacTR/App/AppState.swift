@@ -48,11 +48,13 @@ final class AppState {
     var deviceInfo: DeviceInfo?
     var statusMessage = "Disconnected"
 
-    // Display
+    // Display — the last three come from Preferences (see init) rather than
+    // carrying inline defaults, so there's only one place that says what a
+    // fresh install looks like: DisplaySettings.default.
     var currentSet: DisplaySet = .systemMonitor
-    var brightness: Int = 5
-    var refreshInterval: Double = 0.5
-    var rotateDisplay: Bool = false
+    var brightness: Int
+    var refreshInterval: Double
+    var rotateDisplay: Bool
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -61,6 +63,17 @@ final class AppState {
     // MARK: - Internal
 
     private var engine: DisplayEngine?
+    private let preferences: Preferences
+
+    // MARK: - Init
+
+    init(preferences: Preferences = Preferences()) {
+        self.preferences = preferences
+        let saved = preferences.load()
+        self.rotateDisplay = saved.rotateDisplay
+        self.brightness = saved.brightness
+        self.refreshInterval = saved.refreshInterval
+    }
 
     // MARK: - Lifecycle
 
@@ -104,9 +117,16 @@ final class AppState {
         frameCount = 0
     }
 
-    /// Called when user changes display set, brightness, or interval
+    /// Called when the user changes display set, brightness, rotation, or
+    /// interval. Every Settings control routes through here, so this is the one
+    /// place that needs to persist.
     func applySettings() {
-        engine?.updateSettings(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        preferences.save(DisplaySettings(
+            rotateDisplay: rotateDisplay,
+            brightness: brightness,
+            refreshInterval: refreshInterval))
+        engine?.updateSettings(set: currentSet, brightness: brightness,
+                               interval: refreshInterval, rotate: rotateDisplay)
     }
 
     /// Latest rendered frame for the on-Mac preview window
