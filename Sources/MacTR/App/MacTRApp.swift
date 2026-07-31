@@ -168,6 +168,10 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var previewTimer: Timer?
     private var previewShown = false
 
+    // Settings — one window, reused. Held here because NSWindow does not retain
+    // itself: without this the window could be released while still on screen.
+    private var settingsWindow: NSWindow?
+
     // Menu items that need updating
     private var statusMenuItem: NSMenuItem!
     private var versionMenuItem: NSMenuItem!
@@ -446,15 +450,41 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func openSettings() {
-        // Open settings window
-        let settingsView = SettingsView(state: appState)
-        let hostingController = NSHostingController(rootView: settingsView)
-        let window = NSWindow(contentViewController: hostingController)
-        window.title = "MacTR Settings"
-        window.styleMask = [.titled, .closable]
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        if settingsWindow == nil {
+            settingsWindow = makeSettingsWindow()
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Build the settings window.
+    ///
+    /// The style mask is passed to the initialiser rather than assigned afterwards:
+    /// reassigning it on a live window makes AppKit tear down and rebuild the frame
+    /// view, and the rebuilt content view can land off the pixel grid — which on a
+    /// 1x display shows up as soft, washed-out text.
+    ///
+    /// Size comes from SwiftUI's `fittingSize` so `SettingsView`'s own frame stays
+    /// the single declaration of how big this window is.
+    private func makeSettingsWindow() -> NSWindow {
+        let controller = NSHostingController(rootView: SettingsView(state: appState))
+        let window = NSWindow(
+            contentRect: .zero,
+            styleMask: [.titled, .closable],
+            backing: .buffered, defer: false)
+        window.title = "MacTR Settings"
+        window.contentViewController = controller
+        window.setContentSize(controller.view.fittingSize)
+
+        // Closing must hide, not deallocate — the menu item reopens this instance.
+        window.isReleasedWhenClosed = false
+
+        // center() can leave the origin on a half point, which blurs everything
+        // composited above it. Snap it.
+        window.center()
+        window.setFrameOrigin(NSPoint(x: window.frame.origin.x.rounded(),
+                                      y: window.frame.origin.y.rounded()))
+        return window
     }
 
     @objc private func showAbout() {
