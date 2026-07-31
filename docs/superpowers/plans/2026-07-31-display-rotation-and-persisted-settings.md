@@ -36,7 +36,7 @@
 - Consumes: 无(第一个任务)
 - Produces: `JPEGEncoder.encode(_ image: CGImage, brightness: Int = 1, rotate: Bool = false, maxBytes: Int = 650_000) -> Data?` —— 注意 `rotate` 默认值由 `true` 改为 `false`,且语义变为"true 才旋转"。后续任务和 `AppState` 都按这个语义传值。
 
-- [ ] **Step 1: 加测试单元到 Package.swift**
+- [x] **Step 1: 加测试单元到 Package.swift**
 
 在 `Package.swift` 的 `targets:` 数组最后一个元素(`.executableTarget(name: "MacTR", ...)`)之后追加:
 
@@ -53,7 +53,7 @@
 
 `-I` 那个标志是必需的:测试通过 `@testable import MacTR` 间接加载 `CLibUSB`,而 libusb 的头文件在 Homebrew 目录下。这与 `MacTR` 目标上已有的同名标志一致。
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 创建 `Tests/MacTRTests/JPEGEncoderRotationTests.swift`:
 
@@ -188,7 +188,7 @@ func defaultIsNoRotation() throws {
 }
 ```
 
-- [ ] **Step 3: 跑测试,确认它按预期失败**
+- [x] **Step 3: 跑测试,确认它按预期失败**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 
@@ -199,7 +199,7 @@ Expected:
 
 如果构建阶段就失败(而不是测试失败),看这个任务末尾的「测试跑不起来时的退路」。
 
-- [ ] **Step 4: 修正旋转判断与默认值**
+- [x] **Step 4: 修正旋转判断与默认值**
 
 改 `Sources/MacTR/Rendering/FrameRenderer.swift`。
 
@@ -224,12 +224,12 @@ Expected:
     /// coolers whose LCD is mounted the other way up. Reduces quality if over 650KB.
 ```
 
-- [ ] **Step 5: 跑测试,确认全绿**
+- [x] **Step 5: 跑测试,确认全绿**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 3 条全部 PASS。
 
-- [ ] **Step 6: CI 加一步跑测试**
+- [x] **Step 6: CI 加一步跑测试**
 
 改 `.github/workflows/build.yml`,在 `Show toolchain` 步骤之后、`Build .app` 之前插入:
 
@@ -238,7 +238,7 @@ Expected: 3 条全部 PASS。
         run: swift test
 ```
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add Package.swift Tests/MacTRTests/JPEGEncoderRotationTests.swift \
@@ -278,7 +278,7 @@ Adds the repo's first tests, which is what would have caught this."
   - `struct Preferences` —— `init(store: UserDefaults = .standard)`、`func load() -> DisplaySettings`、`func save(_ settings: DisplaySettings)`、`enum Key`(内部可见,成员 `rotateDisplay` / `brightness` / `refreshInterval`,值为同名字符串)。
   - `func withThrowawayStore(_ body: (UserDefaults) throws -> Void) throws`(测试辅助,Task 3 复用)。
 
-- [ ] **Step 1: 写测试辅助**
+- [x] **Step 1: 写测试辅助**
 
 创建 `Tests/MacTRTests/ThrowawayStore.swift`:
 
@@ -299,7 +299,7 @@ func withThrowawayStore(_ body: (UserDefaults) throws -> Void) throws {
 }
 ```
 
-- [ ] **Step 2: 写测试**
+- [x] **Step 2: 写测试**
 
 创建 `Tests/MacTRTests/PreferencesTests.swift`:
 
@@ -350,12 +350,12 @@ func unsupportedIntervalFallsBack() throws {
 }
 ```
 
-- [ ] **Step 3: 跑测试,确认按预期失败**
+- [x] **Step 3: 跑测试,确认按预期失败**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 编译失败,报找不到 `Preferences` / `DisplaySettings`。Task 1 的三条测试仍然是绿的。
 
-- [ ] **Step 4: 实现 Preferences**
+- [x] **Step 4: 实现 Preferences**
 
 创建 `Sources/MacTR/App/Preferences.swift`:
 
@@ -429,12 +429,12 @@ struct Preferences {
 }
 ```
 
-- [ ] **Step 5: 跑测试,确认全绿**
+- [x] **Step 5: 跑测试,确认全绿**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 7 条全部 PASS(Task 1 的 3 条 + 本任务的 4 条)。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add Sources/MacTR/App/Preferences.swift \
@@ -464,7 +464,7 @@ Nothing reads this yet; AppState is wired up next."
 - Consumes: Task 2 的 `DisplaySettings`、`Preferences`、`withThrowawayStore`
 - Produces: `AppState.init(preferences: Preferences = Preferences())` —— 带默认参数,所以 `MacTRApp.swift:160` 那句 `private let appState = AppState()` 不用改。
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 创建 `Tests/MacTRTests/AppStateSettingsTests.swift`:
 
@@ -510,12 +510,12 @@ func applySettingsPersists() throws {
 
 `applySettings()` 里那句 `engine?.updateSettings(...)` 在测试里是安全的空操作 —— 没调用过 `start()`,`engine` 是 nil。
 
-- [ ] **Step 2: 跑测试,确认按预期失败**
+- [x] **Step 2: 跑测试,确认按预期失败**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 编译失败,报 `AppState` 没有接受 `preferences:` 参数的初始化方法。
 
-- [ ] **Step 3: 加属性和初始化方法**
+- [x] **Step 3: 加属性和初始化方法**
 
 改 `Sources/MacTR/App/AppState.swift`。把这一段:
 
@@ -557,7 +557,7 @@ Expected: 编译失败,报 `AppState` 没有接受 `preferences:` 参数的初�
     }
 ```
 
-- [ ] **Step 4: 让 applySettings 存一次**
+- [x] **Step 4: 让 applySettings 存一次**
 
 把 `applySettings()` 整个方法(约 107–110 行)改成:
 
@@ -575,12 +575,12 @@ Expected: 编译失败,报 `AppState` 没有接受 `preferences:` 参数的初�
     }
 ```
 
-- [ ] **Step 5: 跑测试,确认全绿**
+- [x] **Step 5: 跑测试,确认全绿**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 9 条全部 PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add Sources/MacTR/App/AppState.swift Tests/MacTRTests/AppStateSettingsTests.swift
@@ -605,23 +605,23 @@ StatusBarController is unchanged."
 - Consumes: 无
 - Produces: 无
 
-- [ ] **Step 1: 确认它真的没人用**
+- [x] **Step 1: 确认它真的没人用**
 
 Run: `grep -rn "MenuBarView" Sources/ packaging/ .github/ Package.swift`
 Expected: 只有 `Sources/MacTR/UI/MenuBarView.swift` 自己那两行(第 1 行注释、第 7 行 `struct MenuBarView: View {`)。若别处出现引用,**停下来汇报**,不要删。
 
-- [ ] **Step 2: 删除文件**
+- [x] **Step 2: 删除文件**
 
 ```bash
 git rm Sources/MacTR/UI/MenuBarView.swift
 ```
 
-- [ ] **Step 3: 确认构建和测试仍然通过**
+- [x] **Step 3: 确认构建和测试仍然通过**
 
 Run: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
 Expected: 构建成功,9 条测试全部 PASS。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git commit -m "refactor: drop the dead MenuBarView
@@ -645,7 +645,7 @@ that never runs."
 - Consumes: Task 1–4 的全部产出
 - Produces: 无
 
-- [ ] **Step 1: 清掉可能残留的旧设置**
+- [x] **Step 1: 清掉可能残留的旧设置**
 
 之前从未持久化过任何东西,但如果开发过程中跑过带 `applySettings()` 的版本,存储里可能已经有值,会掩盖"默认就是正的"这个结论。先清空:
 
@@ -657,7 +657,7 @@ defaults delete com.m1ngli.MacTRAI 2>/dev/null; echo "已清空(本来没有也�
 
 **本任务必须用打好包的 .app 验证,不要用 `.build/release/MacTR` 裸二进制。** 裸二进制没有 bundle,设置存到哪个域名不确定,"重启后还在不在"这条验收会不可靠。打包后的 App 才有确定的标识符,也才是用户真正运行的东西。
 
-- [ ] **Step 2: 确认设备在线,并停掉可能占着 USB 的旧进程**
+- [x] **Step 2: 确认设备在线,并停掉可能占着 USB 的旧进程**
 
 ```bash
 pkill -f 'MacTR'   # 裸二进制和打包后的 App 都能覆盖到
@@ -668,7 +668,7 @@ ioreg -p IOUSB -l -w 0 | grep -q '"idProduct" = 21512' && echo "设备在线" ||
 
 设备不在线就先接好线再继续。
 
-- [ ] **Step 3: 打包并启动**
+- [x] **Step 3: 打包并启动**
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./packaging/build-app.sh
@@ -679,11 +679,11 @@ open "dist/MacTR AI.app"
 
 启动后应当能在菜单栏看到显示器形状的图标。图标带红色感叹号说明没连上 LCD,回到 Step 2 检查。
 
-- [ ] **Step 4: 验收第一条 —— 默认就是正的**
+- [x] **Step 4: 验收第一条 —— 默认就是正的**
 
 不要动任何设置。看屏幕:仪表盘应当**正着显示**。若仍然颠倒,说明 Task 1 的方向反了,回去检查。
 
-- [ ] **Step 5: 验收第二条 —— 开关方向正确,且设置存得住**
+- [x] **Step 5: 验收第二条 —— 开关方向正确,且设置存得住**
 
 从菜单栏图标进 Settings → Display:
 
@@ -695,13 +695,13 @@ open "dist/MacTR AI.app"
 
 任何一条不符就停下汇报,不要绕过。
 
-- [ ] **Step 6: 更新 README 里的旋转说明(如有需要)**
+- [x] **Step 6: 更新 README 里的旋转说明(如有需要)**
 
 Run: `grep -rn "rotate\|旋转\|Rotate" README.md README.en.md`
 
 如果文档里描述了旋转开关或 `--rotate` 参数的行为,按新语义更正(`--rotate` 现在是真的旋转;不带它是不旋转)。若两个 README 都没提,跳过这步,不要为此新增章节。
 
-- [ ] **Step 7: 提交并汇总**
+- [ ] **Step 7: 提交并汇总** — 未执行:第 6 步查明两个 README 都没提旋转,无需改动,因此没有这次提交。
 
 如有 README 改动:
 
@@ -726,3 +726,20 @@ git commit -m "docs: correct the rotation flag's described behavior"
 2. **测试里 `try` 塞在 `#expect` 里面。** `#expect(try f(x) == y)` 依赖宏怎么处理 `try`,没必要冒这个险。改成先 `let decoded = try decode(jpeg)` 再断言。`decode` 内部也从 `#require` 换成普通抛错,免去"宏能不能在非测试函数里用"的疑问。
 3. **Task 5 原本用裸二进制验证持久化,这条验收会不可靠。** 裸二进制没有 bundle,设置存到哪个域名不确定。改成用 `packaging/build-app.sh` 打包后的 .app —— 标识符确定(`com.m1ngli.MacTRAI`,已核对 Info.plist),而且那才是用户真正跑的东西。
 4. **`Corner` 挂了个用不上的 `CaseIterable`。** 去掉。
+
+## 追加:Task 6 —— 修 Settings 窗口布局
+
+本任务不在上面的计划里,是实现期间维护者提出后追加的,任务说明单独写在
+`.superpowers/sdd/2026-07-31-display-rotation-and-persisted-settings/task-6-brief.md`。
+
+起因是维护者发现设置窗口的标签栏贴着标题栏。查下去发现另外两个更要紧的问题:窗口尺寸在
+`SettingsView.swift` 和 `MacTRApp.swift` 两处各写了一遍且数值不一致;而且高度不够,Display 页的
+`Rotate 180°` 开关被切在窗口下边缘之外,得滚动才能碰到 —— 而这个开关正是整条分支存在的理由。
+
+改动:删掉 `openSettings()` 里多余的 `setContentSize`(用 `NSWindow(contentViewController:)` 创建的
+窗口本来就按内容视图尺寸来定),把 SwiftUI 的 frame 提到 480×460,并在标签栏上方加 12 点留白。
+提交 `30f44a8`,测试仍为 9/9,并由维护者在真机上确认。
+
+另外维护者注意到标签文字发虚。查证后判定与代码无关:维护者的外接显示器是 2560×1440 的 1 倍屏,而
+macOS 已不再为 1 倍屏做次像素级字体平滑;同一批文字在内置 Retina 屏上是清晰的,维护者已确认。
+因此没有为此改动任何代码。

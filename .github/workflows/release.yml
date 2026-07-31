@@ -21,6 +21,9 @@ jobs:
       - name: Install native deps
         run: brew install libusb pkg-config
 
+      - name: Run tests
+        run: swift test
+
       - name: Derive version from tag
         id: v
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
@@ -57,6 +60,14 @@ jobs:
           DMG=$(ls dist/*.dmg)
           SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
           {
+            echo "## 升级提示"
+            echo
+            echo '**如果升级后画面上下反了**，打开 **设置 → Display → Rotate 180°** 即可，只需设置一次。'
+            echo
+            echo '这个版本修正了一个老问题：旋转开关的行为和它的名字是相反的，导致默认状态下画面被旋转了 180 度。'
+            echo '此前画面正常的人，是因为散热器的装机朝向正好需要这个旋转 —— 升级后要手动把开关打开一次。'
+            echo '之所以只需一次，是因为从这个版本起设置会被保存，不再每次启动都回到默认值。'
+            echo
             echo "## 安装"
             echo
             echo '下载下面的 `.dmg`，打开后把 **MacTR AI** 拖进「应用程序」。'
