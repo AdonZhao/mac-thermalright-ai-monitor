@@ -7,6 +7,7 @@
 import AppKit
 import Foundation
 import Observation
+import Synchronization
 
 // MARK: - Display Set
 
@@ -86,6 +87,15 @@ struct NightSchedule: Equatable, Sendable {
     static func minuteOfDay(of date: Date) -> Int {
         let c = Calendar.current.dateComponents([.hour, .minute], from: date)
         return (c.hour ?? 0) * 60 + (c.minute ?? 0)
+    }
+
+    /// For the log: `18:30→09:00`, not the raw minute counts, which had to be
+    /// divided by 60 in your head at the exact moment you were debugging something.
+    var logDescription: String {
+        guard enabled else { return "off" }
+        guard startMinute != endMinute else { return "off (both times equal)" }
+        func hhmm(_ m: Int) -> String { String(format: "%02d:%02d", m / 60, m % 60) }
+        return "\(hhmm(startMinute))→\(hhmm(endMinute))"
     }
 }
 
@@ -171,18 +181,15 @@ final class AppState {
         engine?.stop()
         engine = nil
         isConnected = false
+        // Also clear this: dropping the engine means no further status will ever
+        // arrive, so whatever it holds now it holds forever. Left true, anything
+        // waiting on "the attempt settled" would wait for the life of the process.
+        isConnecting = false
         statusMessage = "Stopped"
     }
 
     func connect() {
         engine?.reconnect()
-    }
-
-    func disconnect() {
-        engine?.stop()
-        isConnected = false
-        statusMessage = "Disconnected"
-        frameCount = 0
     }
 
     /// Called when the user changes any display setting. Every Settings control
@@ -239,19 +246,41 @@ final class DisplayEngine: @unchecked Sendable {
         return _blackFrame
     }
 
+    /// The state more than one thread touches.
+    ///
+    /// `running` is written from the main actor (`stop()`), from libusb's hotplug
+    /// thread (`onDisconnect`), from the sleep/wake handler, and from the render
+    /// loop itself — while the loop's `while` condition reads it every frame. As a
+    /// plain `var` that was a data race the optimiser is entitled to act on: it
+    /// may hoist the load out of the loop, and then `stop()` never lands.
+    ///
+    /// `settings` and `currentSet` are written from the main actor and read by the
+    /// render loop. Tearing there costs at most one frame, but `night` is a
+    /// (enabled, start, end) triple with a paired invariant, so a torn read can
+    /// produce a window the user never set — say 22:00→09:00 while they were
+    /// moving 18:30→09:00 to 22:00→06:00.
+    ///
+    /// The previous comment here claimed these were "atomically accessed". They
+    /// never were; nothing enforced it.
+    private struct SharedState {
+        var running = false
+        var currentSet: DisplaySet = .systemMonitor
+        /// Seeded from DisplaySettings.default rather than repeating its values, so
+        /// "what does a fresh install look like" has one answer. In practice
+        /// start() overwrites this before the render loop reads it.
+        var settings = DisplaySettings.default
+    }
+    private let shared = Mutex(SharedState())
+
     private let statusCallback: @Sendable (EngineStatus) -> Void
     private let usbQueue = DispatchQueue(label: "com.thermalvision.usb")
+
+    // usbQueue-confined: only the frame loop, connectAndRun and postStatus touch
+    // these, and all three run there.
     private var device: USBDevice?
     private var hotplug: USBHotplug?
-    private var running = false
     private var frameCount = 0
     private var lastFrameSize = 0
-
-    // Settings (atomically accessed). Seeded from DisplaySettings.default rather
-    // than repeating its values, so "what does a fresh install look like" has one
-    // answer. In practice start() overwrites them before the render loop reads.
-    private var currentSet: DisplaySet = .systemMonitor
-    private var settings = DisplaySettings.default
 
     // Renderers
     private let monitorRenderer = MonitorRenderer()
@@ -261,8 +290,7 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     func start(set: DisplaySet, settings: DisplaySettings) {
-        self.currentSet = set
-        self.settings = settings
+        shared.withLock { $0.currentSet = set; $0.settings = settings }
 
         usbQueue.async { [weak self] in
             guard let self else { return }
@@ -274,7 +302,7 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     func stop() {
-        running = false
+        shared.withLock { $0.running = false }
         monitorRenderer.stopMetrics()
         usbQueue.async { [weak self] in
             self?.hotplug?.stop()
@@ -297,21 +325,16 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     func updateSettings(set: DisplaySet, settings: DisplaySettings) {
-        let night = settings.night
-        let nightDescription = night.enabled
-            ? "\(night.startMinute)→\(night.endMinute)"
-            : "off"
         log("[Engine] Settings updated: set=\(set.rawValue), "
             + "brightness=\(settings.brightness), interval=\(settings.refreshInterval), "
-            + "rotate=\(settings.rotateDisplay), night=\(nightDescription)")
-        self.currentSet = set
-        self.settings = settings
+            + "rotate=\(settings.rotateDisplay), blanking=\(settings.night.logDescription)")
+        shared.withLock { $0.currentSet = set; $0.settings = settings }
     }
 
     // MARK: - Private (all on usbQueue)
 
     private func connectAndRun() {
-        guard !running else { return }
+        guard !shared.withLock({ $0.running }) else { return }
 
         // Ensure metrics collection is running (may have been stopped on disconnect/sleep)
         monitorRenderer.startMetrics()
@@ -350,12 +373,20 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     private func runFrameLoop(device: USBDevice, info: DeviceInfo) {
-        running = true
+        shared.withLock { $0.running = true }
         // Metrics already collecting in background via startMetrics()
 
         var nextDeadline = DispatchTime.now()
 
-        while running {
+        // One snapshot per frame, so every decision below is made against a single
+        // coherent set of values. Reading the fields one at a time under separate
+        // locks would let the schedule change halfway through a frame.
+        var frame = shared.withLock { $0 }
+
+        while frame.running {
+            let set = frame.currentSet
+            let settings = frame.settings
+
             // Inside the user's night window: blank the LCD; the dashboard shows on
             // the Mac preview instead. Refresh the black frame slowly to save power.
             let night = settings.night.isNight
@@ -364,14 +395,13 @@ final class DisplayEngine: @unchecked Sendable {
             // data only changes every ~2s. Run fast (15fps) ONLY while a column is
             // animating (agent working → breathing, or done → blinking); otherwise
             // idle at the configured interval to save CPU/power on this always-on app.
-            let animating = !night && (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
+            let animating = !night && (set == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
             let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : settings.refreshInterval)
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
             autoreleasepool {
-                let set = currentSet
                 let bright = settings.brightness
                 let rotate = settings.rotateDisplay
 
@@ -402,10 +432,17 @@ final class DisplayEngine: @unchecked Sendable {
                                    message: "Active")
                     } catch {
                         log("[ERROR] Frame send failed: \(error)")
-                        running = false
+                        shared.withLock { $0.running = false }
                         self.device?.close()
                         self.device = nil
-                        postStatus(connected: false, message: "Disconnected (send error)")
+
+                        // connecting, not merely disconnected: a retry is already
+                        // scheduled below. Reporting a bare disconnect here opened the
+                        // preview window for the five seconds until the retry landed,
+                        // then closed it again — the same flash this engine's status
+                        // reporting was changed to avoid at launch.
+                        postStatus(connected: false, connecting: true,
+                                   message: "Reconnecting...")
 
                         log("[Engine] Will retry connection in 5s...")
                         Thread.sleep(forTimeInterval: 5)
@@ -424,6 +461,10 @@ final class DisplayEngine: @unchecked Sendable {
                 // Work exceeded interval — reset deadline to avoid cascading catch-up
                 nextDeadline = now
             }
+
+            // Re-read for the next frame: this is where a settings change or a
+            // stop() from another thread becomes visible.
+            frame = shared.withLock { $0 }
         }
     }
 
@@ -433,7 +474,7 @@ final class DisplayEngine: @unchecked Sendable {
         hp.onConnect = { [weak self] in
             guard let self else { return }
             self.usbQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, !self.running else { return }
+                guard let self, !self.shared.withLock({ $0.running }) else { return }
                 log("[Hotplug] Attempting reconnect...")
                 self.monitorRenderer.startMetrics()
                 self.connectAndRun()
@@ -443,7 +484,7 @@ final class DisplayEngine: @unchecked Sendable {
         hp.onDisconnect = { [weak self] in
             guard let self else { return }
             log("[Hotplug] Device removed")
-            self.running = false
+            self.shared.withLock { $0.running = false }
             // Metrics keep collecting — the on-Mac preview window takes over
             // rendering while the LCD is away
             self.usbQueue.async { [weak self] in
@@ -467,7 +508,7 @@ final class DisplayEngine: @unchecked Sendable {
                 log("[Wake] macOS woke from sleep — reconnecting in 3s...")
                 self.usbQueue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                     guard let self else { return }
-                    self.running = false
+                    self.shared.withLock { $0.running = false }
                     self.device?.close()
                     self.device = nil
                     log("[Wake] Attempting reconnect...")
@@ -477,10 +518,10 @@ final class DisplayEngine: @unchecked Sendable {
 
             center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
-                if !self.running {
+                if !self.shared.withLock({ $0.running }) {
                     log("[Wake] Screens woke — reconnecting in 2s...")
                     self.usbQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self, !self.running else { return }
+                        guard let self, !self.shared.withLock({ $0.running }) else { return }
                         self.connectAndRun()
                     }
                 }
