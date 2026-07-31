@@ -22,17 +22,17 @@ enum JPEGEncoder {
     // Reusable context for 180° rotation — prevents CG raster data leak
     nonisolated(unsafe) private static var rotateCtx: CGContext?
 
-    /// Encode CGImage to JPEG Data with 180° rotation and brightness adjustment.
-    /// Reduces quality if over 650KB (matches Python behavior).
+    /// Encode a CGImage to JPEG. Turns the frame 180° when `rotate` is true, for
+    /// coolers whose LCD is mounted the other way up. Reduces quality if over 650KB.
     static func encode(
-        _ image: CGImage, brightness: Int = 1, rotate: Bool = true, maxBytes: Int = 650_000
+        _ image: CGImage, brightness: Int = 1, rotate: Bool = false, maxBytes: Int = 650_000
     ) -> Data? {
         let w = image.width
         let h = image.height
 
         var finalImage: CGImage
 
-        if !rotate {
+        if rotate {
             // Reuse rotation context
             if rotateCtx == nil || rotateCtx!.width != w || rotateCtx!.height != h {
                 let colorSpace = CGColorSpaceCreateDeviceRGB()
