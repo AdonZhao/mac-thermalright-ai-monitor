@@ -4,7 +4,7 @@
 
 **Goal:** 让 LCD 默认就正着显示,并让旋转/亮度/刷新间隔三项设置在重启后依然生效。
 
-**Architecture:** 三件事各自独立。一、把 `JPEGEncoder.encode` 里反着写的旋转判断改正,连默认参数一起改,使"开关打开=真的旋转"。二、新增一个可注入存储位置的 `Preferences`,负责三项设置的读写与校验,由 `AppState` 在创建时读、在 `applySettings()` 里写。三、删掉绕过保存路径的死代码 `MenuBarView.swift`。同时建起本仓库第一个测试单元,用一张"只有一角是白色"的图来断言旋转真的发生。
+**Architecture:** 三件事各自独立。一、把 `JPEGEncoder.encode` 里反着写的旋转判断改正,连默认参数一起改,使"开关打开=真的旋转"。二、新增一个可注入存储位置的 `Preferences`,负责三项设置的读写与校验,由 `AppState` 在创建时读、在 `applySettings()` 里写。三、删掉早已无人引用的死代码 `MenuBarView.swift`。同时建起本仓库第一个测试单元,用一张"只有一角是白色"的图来断言旋转真的发生。
 
 **Tech Stack:** Swift 6.1 工具链、SwiftPM、swift-testing(`import Testing`,随工具链自带,无需额外依赖)、CoreGraphics / ImageIO、UserDefaults。
 
@@ -628,9 +628,9 @@ git commit -m "refactor: drop the dead MenuBarView
 
 Left over from the SwiftUI MenuBarExtra approach; the app has used
 StatusBarController with a plain NSStatusItem since v1.1.0 and nothing
-references this view. It still compiled, and it carried a second brightness
-binding that mutated AppState without calling applySettings() — so whoever
-wired it back up would have inherited a control whose changes never persist."
+references this view. It still compiled, though: half the errors from the
+SwiftUIMacros toolchain problem that started this branch came out of a file
+that never runs."
 ```
 
 ---
