@@ -63,8 +63,10 @@ struct Preferences {
     /// The unprefixed keys used before `Key` gained its `display.` prefix.
     ///
     /// Read as a fallback so upgrading does not silently discard settings the
-    /// app only just learned to remember. Nothing writes these any more, so
-    /// they fade out on the first save.
+    /// app only just learned to remember. `save()` deletes them, so the first
+    /// settings change after upgrading retires them for good — which is what
+    /// gives this fallback an end: once a release or two has passed, `LegacyKey`
+    /// and `read(_:or:)` can both go.
     enum LegacyKey {
         static let rotateDisplay = "rotateDisplay"
         static let brightness = "brightness"
@@ -106,6 +108,15 @@ struct Preferences {
         store.set(Self.validMinute(settings.night.endMinute,
                                    default: NightSchedule.default.endMinute),
                   forKey: Key.nightEndMinute)
+
+        // Retire the pre-prefix keys now that their values live under the current
+        // ones. Without this the fallback in read(_:or:) would have to stay
+        // forever, because there would never be a point at which no installation
+        // still depended on it.
+        for legacy in [LegacyKey.rotateDisplay, LegacyKey.brightness,
+                       LegacyKey.refreshInterval] {
+            store.removeObject(forKey: legacy)
+        }
     }
 
     /// Current key first, pre-prefix key second.

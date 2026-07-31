@@ -102,6 +102,29 @@ func outOfRangeNightTimeFallsBack() throws {
     }
 }
 
+/// The comment on `LegacyKey` claims saving retires the old keys. This is the
+/// assertion that makes that claim true rather than aspirational — and it is what
+/// lets the fallback be deleted in a release or two.
+@Test("saving retires the pre-prefix keys")
+func savingRemovesLegacyKeys() throws {
+    try withThrowawayStore { store in
+        store.set(true, forKey: Preferences.LegacyKey.rotateDisplay)
+        store.set(8, forKey: Preferences.LegacyKey.brightness)
+        store.set(2.0, forKey: Preferences.LegacyKey.refreshInterval)
+
+        let prefs = Preferences(store: store)
+        prefs.save(prefs.load())   // what the first settings change does
+
+        #expect(store.object(forKey: Preferences.LegacyKey.rotateDisplay) == nil)
+        #expect(store.object(forKey: Preferences.LegacyKey.brightness) == nil)
+        #expect(store.object(forKey: Preferences.LegacyKey.refreshInterval) == nil)
+        // and the values themselves survived the move
+        #expect(prefs.load()
+            == DisplaySettings(rotateDisplay: true, brightness: 8,
+                               refreshInterval: 2.0, night: .default))
+    }
+}
+
 @Test("a current key wins over a leftover legacy key")
 func currentKeyWinsOverLegacy() throws {
     try withThrowawayStore { store in

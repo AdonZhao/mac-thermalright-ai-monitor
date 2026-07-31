@@ -13,13 +13,17 @@ import Testing
 
 // MARK: - Fixtures
 
-// Deliberately not square, and wider than tall like the real 1920x480 panel: a
-// square fixture would pass just the same if someone swapped a width for a
-// height somewhere in the rotation path. Non-square also exercises the encoder's
-// "is the cached context still the right size" branch.
+// 4:1 like the real 1920x480 panel, so a width swapped for a height somewhere in
+// the rotation path changes the frame's shape. Catching that needs the dimension
+// assertions in the tests below as well as a non-square fixture — the corner
+// comparison alone would not notice, because it measures the decoded image
+// against its own dimensions.
+//
+// patchSide has to stay under half the shorter side, or the corner bands this
+// file samples would overlap and the brightest-corner answer would be ambiguous.
 private let imageWidth = 160
-private let imageHeight = 80
-private let patchSide = 24
+private let imageHeight = 40
+private let patchSide = 12
 
 private struct DecodeFailure: Error {}
 
@@ -37,7 +41,7 @@ private enum Corner {
     }
 }
 
-/// A black square with one white patch, so a 180° turn is detectable purely by
+/// A black frame with one white patch, so a 180° turn is detectable purely by
 /// which corner the patch ends up in.
 private func makeCornerMarkedImage() -> CGImage {
     let ctx = CGContext(
@@ -106,11 +110,21 @@ private func decode(_ jpeg: Data) throws -> CGImage {
 
 // MARK: - Tests
 
+/// The frame that comes back must still be the shape that went in. Without this
+/// a width swapped for a height in the rotation path would go unnoticed: the
+/// corner comparison measures the decoded image against its own dimensions, so
+/// the patch still lands diagonally in a frame that has been transposed.
+private func expectSameShape(_ decoded: CGImage) {
+    #expect(decoded.width == imageWidth)
+    #expect(decoded.height == imageHeight)
+}
+
 @Test("rotate: false leaves the frame where it was")
 func rotateFalseLeavesFrameAlone() throws {
     let original = makeCornerMarkedImage()
     let jpeg = try #require(JPEGEncoder.encode(original, brightness: 1, rotate: false))
     let decoded = try decode(jpeg)
+    expectSameShape(decoded)
     #expect(brightestCorner(of: decoded) == brightestCorner(of: original))
 }
 
@@ -119,15 +133,18 @@ func rotateTrueTurnsFrame() throws {
     let original = makeCornerMarkedImage()
     let jpeg = try #require(JPEGEncoder.encode(original, brightness: 1, rotate: true))
     let decoded = try decode(jpeg)
+    expectSameShape(decoded)
     #expect(brightestCorner(of: decoded) == brightestCorner(of: original).diagonalOpposite)
 }
 
-/// `makeTestJPEG` in MacTRApp.swift relies on the default, and the USB test
-/// pattern must not silently flip when the flag's meaning is corrected.
+/// The USB test pattern rides this default, so it must not silently flip when the
+/// flag's meaning changes. (`makeTestJPEG` forwards `rotate` explicitly now, but
+/// its own default is this one.)
 @Test("the default is no rotation")
 func defaultIsNoRotation() throws {
     let original = makeCornerMarkedImage()
     let jpeg = try #require(JPEGEncoder.encode(original, brightness: 1))
     let decoded = try decode(jpeg)
+    expectSameShape(decoded)
     #expect(brightestCorner(of: decoded) == brightestCorner(of: original))
 }

@@ -104,19 +104,26 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Night") {
-                Toggle("Blank the LCD overnight", isOn: $state.night.enabled)
+            // "Blanking" rather than "Night": the window is whatever the user sets,
+            // and 10:00–12:00 is not a night.
+            Section("Blanking") {
+                Toggle("Blank the LCD on a schedule", isOn: $state.night.enabled)
                     .onChange(of: state.night.enabled) {
                         state.applySettings()
                     }
 
                 DatePicker("From", selection: nightStart, displayedComponents: .hourAndMinute)
                     .disabled(!state.night.enabled)
+                    .onChange(of: state.night.startMinute) {
+                        state.applySettings()
+                    }
                 DatePicker("Until", selection: nightEnd, displayedComponents: .hourAndMinute)
                     .disabled(!state.night.enabled)
+                    .onChange(of: state.night.endMinute) {
+                        state.applySettings()
+                    }
 
-                Text("The dashboard moves to a window on the Mac while the LCD is dark. "
-                    + "Setting both times the same leaves it on.")
+                Text(blankingExplanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -216,29 +223,27 @@ struct SettingsView: View {
 
     // DatePicker speaks Date; the schedule stores minutes since midnight, because
     // a window like 18:30→09:00 has to be comparable without dragging a calendar
-    // date into it. These bind the two, and save on every edit — the pickers have
-    // no discrete "committed" moment to hang an onChange on.
+    // date into it. These bindings only convert — persisting is left to the
+    // .onChange handlers on the pickers, the same way every other control in this
+    // file does it.
     private var nightStart: Binding<Date> { nightTime(\.startMinute) }
     private var nightEnd: Binding<Date> { nightTime(\.endMinute) }
 
+    /// Describes what the current setting actually does. Two equal times is the
+    /// one combination that looks configured but has no effect, so it says so
+    /// instead of leaving the user to wonder why the panel never goes dark.
+    private var blankingExplanation: String {
+        if state.night.enabled && state.night.startMinute == state.night.endMinute {
+            return "Both times are the same, so the LCD is never blanked. "
+                + "Move them apart, or switch this off."
+        }
+        return "While the LCD is dark the dashboard moves to a window on the Mac."
+    }
+
     private func nightTime(_ minute: WritableKeyPath<NightSchedule, Int>) -> Binding<Date> {
         Binding(
-            get: { Self.time(atMinute: state.night[keyPath: minute]) },
-            set: {
-                state.night[keyPath: minute] = Self.minuteOfDay(of: $0)
-                state.applySettings()
-            }
+            get: { state.night.time(atMinuteOf: minute) },
+            set: { state.night[keyPath: minute] = NightSchedule.minuteOfDay(of: $0) }
         )
-    }
-
-    /// Today at `m` minutes past midnight — only the time is ever read back out.
-    private static func time(atMinute m: Int) -> Date {
-        Calendar.current.date(
-            bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
-    }
-
-    private static func minuteOfDay(of date: Date) -> Int {
-        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
-        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 }
