@@ -22,18 +22,38 @@ enum DisplaySet: String, CaseIterable, Identifiable, Sendable {
 
 // MARK: - Night schedule
 
-/// Nightly window during which the LCD is blanked and the dashboard shows on the
-/// Mac instead. Defaults to 18:30 → 09:00 (spans midnight).
-enum NightSchedule {
-    static let startMinute = 18 * 60 + 30   // 18:30
-    static let endMinute = 9 * 60           // 09:00
+/// The window during which the LCD is blanked and the dashboard shows on the Mac
+/// instead. A value rather than a global so the engine can be handed the user's
+/// current schedule alongside the rest of the settings, and so it is testable
+/// without waiting for the clock.
+struct NightSchedule: Equatable, Sendable {
+    var enabled: Bool
+    /// Minutes since midnight, 0..<1440.
+    var startMinute: Int
+    var endMinute: Int
 
-    static var isNight: Bool {
-        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
-        let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+    static let `default` = NightSchedule(
+        enabled: true,
+        startMinute: 18 * 60 + 30,   // 18:30
+        endMinute: 9 * 60)           // 09:00
+
+    static let minutesPerDay = 24 * 60
+
+    /// Whether `minute` (minutes since midnight) falls inside the window.
+    ///
+    /// A zero-length window means the user dragged both ends together, which
+    /// reads as "stop blanking" rather than "blank around the clock" — so it
+    /// behaves the same as switching the feature off.
+    func covers(minute m: Int) -> Bool {
+        guard enabled, startMinute != endMinute else { return false }
         return startMinute < endMinute
             ? (m >= startMinute && m < endMinute)      // same-day window
             : (m >= startMinute || m < endMinute)      // window spanning midnight
+    }
+
+    var isNight: Bool {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        return covers(minute: (c.hour ?? 0) * 60 + (c.minute ?? 0))
     }
 }
 
@@ -45,16 +65,21 @@ final class AppState {
 
     // Connection (UI-facing)
     var isConnected = false
+    /// A connect attempt is in flight. Starts true because `start()` kicks one
+    /// off immediately: anything that treats "not connected" as "no panel" would
+    /// otherwise reach that conclusion before the first attempt has answered.
+    var isConnecting = true
     var deviceInfo: DeviceInfo?
     var statusMessage = "Disconnected"
 
-    // Display — the last three come from Preferences (see init) rather than
-    // carrying inline defaults, so there's only one place that says what a
-    // fresh install looks like: DisplaySettings.default.
+    // Display — everything but currentSet comes from Preferences (see init)
+    // rather than carrying inline defaults, so there's only one place that says
+    // what a fresh install looks like: DisplaySettings.default.
     var currentSet: DisplaySet = .systemMonitor
     var brightness: Int
     var refreshInterval: Double
     var rotateDisplay: Bool
+    var night: NightSchedule
 
     // Metrics (for menu bar display)
     var frameCount = 0
@@ -73,6 +98,16 @@ final class AppState {
         self.rotateDisplay = saved.rotateDisplay
         self.brightness = saved.brightness
         self.refreshInterval = saved.refreshInterval
+        self.night = saved.night
+    }
+
+    /// The persisted settings as they currently stand in memory.
+    private var displaySettings: DisplaySettings {
+        DisplaySettings(
+            rotateDisplay: rotateDisplay,
+            brightness: brightness,
+            refreshInterval: refreshInterval,
+            night: night)
     }
 
     // MARK: - Lifecycle
@@ -83,6 +118,7 @@ final class AppState {
                 guard let self else { return }
                 let prev = self.isConnected
                 self.isConnected = status.connected
+                self.isConnecting = status.connecting
                 self.deviceInfo = status.deviceInfo ?? self.deviceInfo
                 self.statusMessage = status.message
                 self.frameCount = status.frameCount
@@ -96,7 +132,7 @@ final class AppState {
             }
         }
         engine = eng
-        eng.start(set: currentSet, brightness: brightness, interval: refreshInterval, rotate: rotateDisplay)
+        eng.start(set: currentSet, settings: displaySettings)
     }
 
     func stop() {
@@ -117,16 +153,11 @@ final class AppState {
         frameCount = 0
     }
 
-    /// Called when the user changes display set, brightness, rotation, or
-    /// interval. Every Settings control routes through here, so this is the one
-    /// place that needs to persist.
+    /// Called when the user changes any display setting. Every Settings control
+    /// routes through here, so this is the one place that needs to persist.
     func applySettings() {
-        preferences.save(DisplaySettings(
-            rotateDisplay: rotateDisplay,
-            brightness: brightness,
-            refreshInterval: refreshInterval))
-        engine?.updateSettings(set: currentSet, brightness: brightness,
-                               interval: refreshInterval, rotate: rotateDisplay)
+        preferences.save(displaySettings)
+        engine?.updateSettings(set: currentSet, settings: displaySettings)
     }
 
     /// Latest rendered frame for the on-Mac preview window
@@ -139,6 +170,11 @@ final class AppState {
 
 struct EngineStatus: Sendable {
     let connected: Bool
+    /// A connect attempt is in flight — neither connected nor known absent yet.
+    /// Opening the device and handshaking takes a few seconds, and callers that
+    /// treat "not connected" as "no panel" during that window act on a verdict
+    /// that hasn't been reached.
+    let connecting: Bool
     let deviceInfo: DeviceInfo?
     let message: String
     let frameCount: Int
@@ -149,9 +185,15 @@ struct EngineStatus: Sendable {
 
 final class DisplayEngine: @unchecked Sendable {
 
-    // Cached all-black JPEG used to blank the LCD during the night window.
+    /// Cached all-black JPEG used to blank the LCD during the night window.
+    ///
+    /// Takes no rotation argument on purpose: an all-black frame turned 180° is
+    /// the same frame, so one cached copy serves both orientations. It used to
+    /// take a `rotate:` flag that only the first call could influence — the
+    /// cache short-circuits every call after it — which is the same species of
+    /// lying parameter as the encode flag this file's history is about.
     nonisolated(unsafe) private static var _blackFrame: Data?
-    static func blackFrame(rotate: Bool) -> Data? {
+    static func blackFrame() -> Data? {
         if let f = _blackFrame { return f }
         let w = Layout.width, h = Layout.height
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
@@ -161,7 +203,7 @@ final class DisplayEngine: @unchecked Sendable {
         ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         guard let img = ctx.makeImage() else { return nil }
-        _blackFrame = JPEGEncoder.encode(img, brightness: 1, rotate: rotate)
+        _blackFrame = JPEGEncoder.encode(img, brightness: 1)
         return _blackFrame
     }
 
@@ -173,11 +215,11 @@ final class DisplayEngine: @unchecked Sendable {
     private var frameCount = 0
     private var lastFrameSize = 0
 
-    // Settings (atomically accessed)
+    // Settings (atomically accessed). Seeded from DisplaySettings.default rather
+    // than repeating its values, so "what does a fresh install look like" has one
+    // answer. In practice start() overwrites them before the render loop reads.
     private var currentSet: DisplaySet = .systemMonitor
-    private var brightness: Int = 5
-    private var interval: Double = 0.5
-    private var rotateDisplay: Bool = false
+    private var settings = DisplaySettings.default
 
     // Renderers
     private let monitorRenderer = MonitorRenderer()
@@ -186,11 +228,9 @@ final class DisplayEngine: @unchecked Sendable {
         self.statusCallback = statusCallback
     }
 
-    func start(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
+    func start(set: DisplaySet, settings: DisplaySettings) {
         self.currentSet = set
-        self.brightness = brightness
-        self.interval = interval
-        self.rotateDisplay = rotate
+        self.settings = settings
 
         usbQueue.async { [weak self] in
             guard let self else { return }
@@ -224,12 +264,16 @@ final class DisplayEngine: @unchecked Sendable {
         monitorRenderer.render()
     }
 
-    func updateSettings(set: DisplaySet, brightness: Int, interval: Double, rotate: Bool) {
-        log("[Engine] Settings updated: set=\(set.rawValue), brightness=\(brightness), interval=\(interval), rotate=\(rotate)")
+    func updateSettings(set: DisplaySet, settings: DisplaySettings) {
+        let night = settings.night
+        let nightDescription = night.enabled
+            ? "\(night.startMinute)→\(night.endMinute)"
+            : "off"
+        log("[Engine] Settings updated: set=\(set.rawValue), "
+            + "brightness=\(settings.brightness), interval=\(settings.refreshInterval), "
+            + "rotate=\(settings.rotateDisplay), night=\(nightDescription)")
         self.currentSet = set
-        self.brightness = brightness
-        self.interval = interval
-        self.rotateDisplay = rotate
+        self.settings = settings
     }
 
     // MARK: - Private (all on usbQueue)
@@ -245,7 +289,7 @@ final class DisplayEngine: @unchecked Sendable {
         device = nil
         frameCount = 0
 
-        postStatus(connected: false, message: "Connecting...")
+        postStatus(connected: false, connecting: true, message: "Connecting...")
 
         let dev = USBDevice()
         do {
@@ -280,29 +324,29 @@ final class DisplayEngine: @unchecked Sendable {
         var nextDeadline = DispatchTime.now()
 
         while running {
-            // Night window (18:30–09:00): blank the LCD; the dashboard shows on the
-            // Mac preview instead. Refresh the black frame slowly to save power.
-            let night = NightSchedule.isNight
+            // Inside the user's night window: blank the LCD; the dashboard shows on
+            // the Mac preview instead. Refresh the black frame slowly to save power.
+            let night = settings.night.isNight
 
             // Adaptive frame rate: the device sustains ~19fps, but the dashboard's
             // data only changes every ~2s. Run fast (15fps) ONLY while a column is
             // animating (agent working → breathing, or done → blinking); otherwise
             // idle at the configured interval to save CPU/power on this always-on app.
             let animating = !night && (currentSet == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
-            let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : interval)
+            let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : settings.refreshInterval)
             nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
             autoreleasepool {
                 let set = currentSet
-                let bright = brightness
-                let rotate = rotateDisplay
+                let bright = settings.brightness
+                let rotate = settings.rotateDisplay
 
                 let jpeg: Data?
 
                 if night {
-                    jpeg = DisplayEngine.blackFrame(rotate: rotate)
+                    jpeg = DisplayEngine.blackFrame()
                 } else {
                     switch set {
                     case .systemMonitor:
@@ -413,10 +457,12 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     private func postStatus(
-        connected: Bool, deviceInfo: DeviceInfo? = nil, message: String
+        connected: Bool, connecting: Bool = false,
+        deviceInfo: DeviceInfo? = nil, message: String
     ) {
         let status = EngineStatus(
             connected: connected,
+            connecting: connecting,
             deviceInfo: deviceInfo,
             message: message,
             frameCount: frameCount,

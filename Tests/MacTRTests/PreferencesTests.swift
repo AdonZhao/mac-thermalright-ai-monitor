@@ -17,7 +17,7 @@ func emptyStoreYieldsDefaults() throws {
 func savedSettingsRoundTrip() throws {
     try withThrowawayStore { store in
         let prefs = Preferences(store: store)
-        let settings = DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0)
+        let settings = DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0, night: .default)
         prefs.save(settings)
         #expect(prefs.load() == settings)
     }
@@ -40,5 +40,74 @@ func unsupportedIntervalFallsBack() throws {
         store.set(7.5, forKey: Preferences.Key.refreshInterval)
         #expect(Preferences(store: store).load().refreshInterval
             == DisplaySettings.default.refreshInterval)
+    }
+}
+
+/// The picker and the validator read the same list, so this holds by
+/// construction — which is the point. It fails the moment someone reintroduces a
+/// second hardcoded list of options, the mistake that would silently reset a
+/// user's choice at the next launch.
+@Test("every interval the picker offers survives a round trip")
+func everyOfferedIntervalRoundTrips() throws {
+    try withThrowawayStore { store in
+        let prefs = Preferences(store: store)
+        for choice in Preferences.refreshIntervalChoices {
+            prefs.save(DisplaySettings(
+                rotateDisplay: false, brightness: 5, refreshInterval: choice.seconds, night: .default))
+            #expect(prefs.load().refreshInterval == choice.seconds,
+                    "\(choice.label) did not survive")
+        }
+    }
+}
+
+/// Settings written before the keys gained their `display.` prefix must still be
+/// honoured — this app only just learned to remember them, so dropping them on
+/// the very next upgrade would undo the point.
+@Test("settings stored under the pre-prefix keys are still read")
+func legacyKeysAreStillRead() throws {
+    try withThrowawayStore { store in
+        store.set(true, forKey: Preferences.LegacyKey.rotateDisplay)
+        store.set(8, forKey: Preferences.LegacyKey.brightness)
+        store.set(2.0, forKey: Preferences.LegacyKey.refreshInterval)
+
+        #expect(Preferences(store: store).load()
+            == DisplaySettings(rotateDisplay: true, brightness: 8, refreshInterval: 2.0, night: .default))
+    }
+}
+
+@Test("the night schedule survives a round trip, switched off included")
+func nightScheduleRoundTrips() throws {
+    try withThrowawayStore { store in
+        let prefs = Preferences(store: store)
+        var settings = DisplaySettings.default
+        settings.night = NightSchedule(enabled: false, startMinute: 20 * 60, endMinute: 7 * 60)
+
+        prefs.save(settings)
+
+        #expect(prefs.load().night == settings.night)
+    }
+}
+
+/// A time of day outside the day was never a time, so there is no nearer one to
+/// honour — unlike brightness, which clamps.
+@Test("an out-of-day night time falls back to the default")
+func outOfRangeNightTimeFallsBack() throws {
+    try withThrowawayStore { store in
+        store.set(24 * 60, forKey: Preferences.Key.nightStartMinute)   // 24:00 is not a time
+        store.set(-30, forKey: Preferences.Key.nightEndMinute)
+
+        let night = Preferences(store: store).load().night
+        #expect(night.startMinute == NightSchedule.default.startMinute)
+        #expect(night.endMinute == NightSchedule.default.endMinute)
+    }
+}
+
+@Test("a current key wins over a leftover legacy key")
+func currentKeyWinsOverLegacy() throws {
+    try withThrowawayStore { store in
+        store.set(3, forKey: Preferences.LegacyKey.brightness)
+        store.set(9, forKey: Preferences.Key.brightness)
+
+        #expect(Preferences(store: store).load().brightness == 9)
     }
 }

@@ -161,7 +161,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var menu: NSMenu!
 
     // On-Mac preview — shown automatically while the LCD is disconnected OR during
-    // the nightly window (18:30–09:00, when the LCD is blanked). `previewShown`
+    // the user's night window, when the LCD is blanked. `previewShown`
     // tracks our intent so the timer doesn't re-open / re-focus it every tick.
     private var previewWindow: NSWindow?
     private var previewImageView: NSImageView?
@@ -211,11 +211,11 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         // Start engine
         appState.start()
 
-        // No LCD after the initial connect attempt → fall back to on-Mac preview.
-        // Delayed so a present device can connect first without a window flash.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.updateDisplayTarget()
-        }
+        // No delayed first check any more: it existed to keep the preview from
+        // flashing before the LCD answered, but the timer below reached the same
+        // decision a second in and raced past it — and 2s was short of the ~4s a
+        // connect actually takes. updateDisplayTarget() now waits for the attempt
+        // to settle instead of for the clock, so the timer alone is enough.
 
         // Timer to refresh menu + icon, and to react to the night-window schedule
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -376,8 +376,14 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Show the dashboard on the Mac when the LCD isn't the right target:
     /// either it's disconnected, or we're inside the night window (LCD blanked).
     /// Transition-based so we don't grab focus every second.
+    ///
+    /// A connect attempt in flight is not "disconnected" — opening the device and
+    /// handshaking takes a few seconds, and treating that window as "no panel"
+    /// popped the preview open at every launch only to yank it away once the LCD
+    /// answered. The same held for every wake-from-sleep reconnect.
     private func updateDisplayTarget() {
-        let wantPreview = !appState.isConnected || NightSchedule.isNight
+        let noPanel = !appState.isConnected && !appState.isConnecting
+        let wantPreview = noPanel || appState.night.isNight
         if wantPreview && !previewShown {
             showPreview(); previewShown = true
         } else if !wantPreview && previewShown {
@@ -721,7 +727,8 @@ private func runCLI() {
     }
 
     if isTest {
-        guard let jpeg = makeTestJPEG(width: info.width, height: info.height) else {
+        guard let jpeg = makeTestJPEG(width: info.width, height: info.height,
+                                      rotate: rotate) else {
             log("[ERROR] Failed to create test image")
             return
         }
@@ -783,7 +790,7 @@ private func parseFlag(_ args: [String], flag: String) -> Int? {
 
 // MARK: - Test Image
 
-func makeTestJPEG(width: Int, height: Int) -> Data? {
+func makeTestJPEG(width: Int, height: Int, rotate: Bool = false) -> Data? {
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(
         data: nil, width: width, height: height,
@@ -830,5 +837,5 @@ func makeTestJPEG(width: Int, height: Int) -> Data? {
     ctx.restoreGState()
 
     guard let image = ctx.makeImage() else { return nil }
-    return JPEGEncoder.encode(image)
+    return JPEGEncoder.encode(image, rotate: rotate)
 }

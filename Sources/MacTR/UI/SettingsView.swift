@@ -46,10 +46,12 @@ struct SettingsView: View {
             }
 
             Section("Refresh") {
+                // Built from Preferences' own list: an option offered here is
+                // therefore always one load() will accept back.
                 Picker("Interval", selection: $state.refreshInterval) {
-                    Text("0.5s (default)").tag(0.5)
-                    Text("1.0s").tag(1.0)
-                    Text("2.0s").tag(2.0)
+                    ForEach(Preferences.refreshIntervalChoices) { choice in
+                        Text(choice.label).tag(choice.seconds)
+                    }
                 }
                 .onChange(of: state.refreshInterval) {
                     state.applySettings()
@@ -77,7 +79,7 @@ struct SettingsView: View {
 
             Section("Brightness") {
                 HStack {
-                    Slider(value: brightnessBinding, in: 1...10, step: 1) {
+                    Slider(value: brightnessBinding, in: Preferences.brightnessBounds, step: 1) {
                         Text("Level")
                     }
                     Text("\(state.brightness)")
@@ -98,6 +100,23 @@ struct SettingsView: View {
                         state.applySettings()
                     }
                 Text("Enable if display appears upside down")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Night") {
+                Toggle("Blank the LCD overnight", isOn: $state.night.enabled)
+                    .onChange(of: state.night.enabled) {
+                        state.applySettings()
+                    }
+
+                DatePicker("From", selection: nightStart, displayedComponents: .hourAndMinute)
+                    .disabled(!state.night.enabled)
+                DatePicker("Until", selection: nightEnd, displayedComponents: .hourAndMinute)
+                    .disabled(!state.night.enabled)
+
+                Text("The dashboard moves to a window on the Mac while the LCD is dark. "
+                    + "Setting both times the same leaves it on.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -193,5 +212,33 @@ struct SettingsView: View {
             get: { Double(state.brightness) },
             set: { state.brightness = Int($0) }
         )
+    }
+
+    // DatePicker speaks Date; the schedule stores minutes since midnight, because
+    // a window like 18:30→09:00 has to be comparable without dragging a calendar
+    // date into it. These bind the two, and save on every edit — the pickers have
+    // no discrete "committed" moment to hang an onChange on.
+    private var nightStart: Binding<Date> { nightTime(\.startMinute) }
+    private var nightEnd: Binding<Date> { nightTime(\.endMinute) }
+
+    private func nightTime(_ minute: WritableKeyPath<NightSchedule, Int>) -> Binding<Date> {
+        Binding(
+            get: { Self.time(atMinute: state.night[keyPath: minute]) },
+            set: {
+                state.night[keyPath: minute] = Self.minuteOfDay(of: $0)
+                state.applySettings()
+            }
+        )
+    }
+
+    /// Today at `m` minutes past midnight — only the time is ever read back out.
+    private static func time(atMinute m: Int) -> Date {
+        Calendar.current.date(
+            bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
+    }
+
+    private static func minuteOfDay(of date: Date) -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 }

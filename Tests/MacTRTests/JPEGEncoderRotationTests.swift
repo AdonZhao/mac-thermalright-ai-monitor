@@ -13,7 +13,12 @@ import Testing
 
 // MARK: - Fixtures
 
-private let imageSide = 120
+// Deliberately not square, and wider than tall like the real 1920x480 panel: a
+// square fixture would pass just the same if someone swapped a width for a
+// height somewhere in the rotation path. Non-square also exercises the encoder's
+// "is the cached context still the right size" branch.
+private let imageWidth = 160
+private let imageHeight = 80
 private let patchSide = 24
 
 private struct DecodeFailure: Error {}
@@ -36,12 +41,12 @@ private enum Corner {
 /// which corner the patch ends up in.
 private func makeCornerMarkedImage() -> CGImage {
     let ctx = CGContext(
-        data: nil, width: imageSide, height: imageSide,
-        bitsPerComponent: 8, bytesPerRow: imageSide * 4,
+        data: nil, width: imageWidth, height: imageHeight,
+        bitsPerComponent: 8, bytesPerRow: imageWidth * 4,
         space: CGColorSpaceCreateDeviceRGB(),
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-    ctx.fill(CGRect(x: 0, y: 0, width: imageSide, height: imageSide))
+    ctx.fill(CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
     ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
     ctx.fill(CGRect(x: 0, y: 0, width: patchSide, height: patchSide))
     return ctx.makeImage()!
