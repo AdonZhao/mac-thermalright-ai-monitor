@@ -52,8 +52,40 @@ struct NightSchedule: Equatable, Sendable {
     }
 
     var isNight: Bool {
-        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
-        return covers(minute: (c.hour ?? 0) * 60 + (c.minute ?? 0))
+        covers(minute: Self.minuteOfDay(of: Date()))
+    }
+
+    // MARK: - Bridging to DatePicker
+    //
+    // DatePicker deals in Date, the schedule in minutes since midnight. These two
+    // live here rather than in the view so they can be tested: the awkward cases
+    // are all in this conversion, not in covers(minute:).
+
+    /// The wall-clock time this schedule holds at `minute`, as a `Date`.
+    ///
+    /// Built from a fixed reference day rather than today, because "today" can be
+    /// a day that has no 02:30 — on a spring-forward date `date(bySettingHour:)`
+    /// skips to the next valid time, which would show a stored 02:30 as 03:00 and
+    /// silently rewrite it the moment the user nudged the picker. Only the time of
+    /// day is ever read back out, so the day itself is irrelevant.
+    func time(atMinuteOf minute: WritableKeyPath<NightSchedule, Int>) -> Date {
+        Self.time(atMinute: self[keyPath: minute])
+    }
+
+    static func time(atMinute m: Int) -> Date {
+        var c = DateComponents()
+        c.year = 2001; c.month = 1; c.day = 1   // a day with no DST transition anywhere
+        c.hour = m / 60
+        c.minute = m % 60
+        // Components this explicit resolve on every calendar; the fallback is
+        // unreachable in practice and deliberately not "now", which would show the
+        // current time as if it were the configured one.
+        return Calendar.current.date(from: c) ?? Date(timeIntervalSinceReferenceDate: 0)
+    }
+
+    static func minuteOfDay(of date: Date) -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 }
 

@@ -3,6 +3,7 @@
 // Uses covers(minute:) rather than isNight so the assertions don't depend on what
 // time the suite happens to run.
 
+import Foundation
 import Testing
 
 @testable import MacTR
@@ -54,4 +55,47 @@ func zeroLengthWindowCoversNothing() {
 
     #expect(!s.covers(minute: minute(9)))
     #expect(!s.covers(minute: minute(21)))
+}
+
+// MARK: - Date bridging
+//
+// The DatePicker conversion is where the awkward cases live, so these cover it
+// directly. Every minute of the day round-trips, including the ones a
+// spring-forward day does not contain — the pickers must not quietly rewrite a
+// stored time just because today skipped it.
+
+@Test("every minute of the day survives the Date round trip")
+func everyMinuteRoundTrips() {
+    for m in 0..<NightSchedule.minutesPerDay {
+        let back = NightSchedule.minuteOfDay(of: NightSchedule.time(atMinute: m))
+        #expect(back == m, "minute \(m) came back as \(back)")
+    }
+}
+
+/// 02:30 does not exist on a spring-forward date. Building the picker's Date from
+/// "today" made Calendar skip to the next valid time, so a stored 02:30 displayed
+/// as 03:00 and one nudge made that permanent. A fixed reference day avoids it.
+@Test("times inside a spring-forward gap still round trip")
+func springForwardGapRoundTrips() {
+    // America/Los_Angeles jumps 02:00 -> 03:00; Europe/London jumps 01:00 -> 02:00.
+    for zoneName in ["America/Los_Angeles", "Europe/London", "Australia/Sydney"] {
+        guard let zone = TimeZone(identifier: zoneName) else {
+            Issue.record("unknown time zone \(zoneName)"); continue
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+
+        for m in [minute(1), minute(1, 30), minute(2), minute(2, 30), minute(3)] {
+            var c = DateComponents()
+            c.year = 2001; c.month = 1; c.day = 1
+            c.hour = m / 60
+            c.minute = m % 60
+            guard let date = calendar.date(from: c) else {
+                Issue.record("\(zoneName): could not build \(m)"); continue
+            }
+            let parts = calendar.dateComponents([.hour, .minute], from: date)
+            let back = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+            #expect(back == m, "\(zoneName): minute \(m) came back as \(back)")
+        }
+    }
 }
