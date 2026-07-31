@@ -45,6 +45,10 @@ final class AppState {
 
     // Connection (UI-facing)
     var isConnected = false
+    /// A connect attempt is in flight. Starts true because `start()` kicks one
+    /// off immediately: anything that treats "not connected" as "no panel" would
+    /// otherwise reach that conclusion before the first attempt has answered.
+    var isConnecting = true
     var deviceInfo: DeviceInfo?
     var statusMessage = "Disconnected"
 
@@ -83,6 +87,7 @@ final class AppState {
                 guard let self else { return }
                 let prev = self.isConnected
                 self.isConnected = status.connected
+                self.isConnecting = status.connecting
                 self.deviceInfo = status.deviceInfo ?? self.deviceInfo
                 self.statusMessage = status.message
                 self.frameCount = status.frameCount
@@ -139,6 +144,11 @@ final class AppState {
 
 struct EngineStatus: Sendable {
     let connected: Bool
+    /// A connect attempt is in flight — neither connected nor known absent yet.
+    /// Opening the device and handshaking takes a few seconds, and callers that
+    /// treat "not connected" as "no panel" during that window act on a verdict
+    /// that hasn't been reached.
+    let connecting: Bool
     let deviceInfo: DeviceInfo?
     let message: String
     let frameCount: Int
@@ -254,7 +264,7 @@ final class DisplayEngine: @unchecked Sendable {
         device = nil
         frameCount = 0
 
-        postStatus(connected: false, message: "Connecting...")
+        postStatus(connected: false, connecting: true, message: "Connecting...")
 
         let dev = USBDevice()
         do {
@@ -422,10 +432,12 @@ final class DisplayEngine: @unchecked Sendable {
     }
 
     private func postStatus(
-        connected: Bool, deviceInfo: DeviceInfo? = nil, message: String
+        connected: Bool, connecting: Bool = false,
+        deviceInfo: DeviceInfo? = nil, message: String
     ) {
         let status = EngineStatus(
             connected: connected,
+            connecting: connecting,
             deviceInfo: deviceInfo,
             message: message,
             frameCount: frameCount,
