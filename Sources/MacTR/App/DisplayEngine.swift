@@ -34,6 +34,13 @@ final class DisplayEngine: @unchecked Sendable {
     /// take a `rotate:` flag that only the first call could influence — the
     /// cache short-circuits every call after it — which is the same species of
     /// lying parameter as the encode flag this file's history is about.
+    /// Deadline increment for one frame, nanosecond-precise. Truncating to
+    /// whole milliseconds made 1/15s into 66ms — the loop ran at 15.15fps,
+    /// ~1% frames nobody asked for.
+    static func frameDeadlineStep(_ interval: Double) -> DispatchTimeInterval {
+        .nanoseconds(Int(interval * 1_000_000_000))
+    }
+
     nonisolated(unsafe) private static var _blackFrame: Data?
     static func blackFrame() -> Data? {
         if let f = _blackFrame { return f }
@@ -200,7 +207,7 @@ final class DisplayEngine: @unchecked Sendable {
             // idle at the configured interval to save CPU/power on this always-on app.
             let animating = !night && (set == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
             let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : settings.refreshInterval)
-            nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
+            nextDeadline = nextDeadline + DisplayEngine.frameDeadlineStep(frameInterval)
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
