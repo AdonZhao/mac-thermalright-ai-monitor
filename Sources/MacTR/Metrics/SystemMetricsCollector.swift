@@ -77,6 +77,18 @@ struct SystemSnapshot: Sendable {
     let processCount: Int
 }
 
+// Equatable so the renderer can tell "same data, skip the static-layer rebuild".
+// CPUSnapshot is spelled out because tuples block synthesis.
+extension CPUSnapshot: Equatable {
+    static func == (a: CPUSnapshot, b: CPUSnapshot) -> Bool {
+        a.perCore == b.perCore && a.total == b.total
+            && a.loadAvg == b.loadAvg && a.pCoreCount == b.pCoreCount
+    }
+}
+extension MemorySnapshot: Equatable {}
+extension TemperatureSnapshot: Equatable {}
+extension SystemSnapshot: Equatable {}
+
 // MARK: - Collector
 
 final class SystemMetricsCollector: @unchecked Sendable {

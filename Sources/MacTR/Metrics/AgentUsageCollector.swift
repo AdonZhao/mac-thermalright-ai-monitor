@@ -61,6 +61,10 @@ struct AgentsSnapshot: Sendable {
     let codex: AgentUsage
 }
 
+// Equatable so the renderer can tell "same data, skip the static-layer rebuild".
+extension AgentUsage: Equatable {}
+extension AgentsSnapshot: Equatable {}
+
 // MARK: - Collector
 
 final class AgentUsageCollector: @unchecked Sendable {
