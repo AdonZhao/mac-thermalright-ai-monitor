@@ -801,39 +801,106 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     ///   isWorking      (running a turn)  → slow, gentle breathing (~5s period)
     ///   idle                            → static tint
     /// Time-driven, drawn per frame UNDER the cached column content layer.
-    private func renderColumnTint(_ ctx: CGContext, x: Int, w: Int, py: Int,
-                                  name: String, accent: CGColor, usage: AgentUsage,
-                                  t: Double) {
+    ///
+    /// Alphas for the fill and (optional) border at time t.
+    /// Linear triangle breathing (0→1→0 over 5s). A constant per-frame delta reads
+    /// far smoother than cosine easing at the display's low frame rate — no stutter
+    /// where the cosine flattens near its peaks/troughs.
+    private func tintPhase(name: String, usage: AgentUsage, t: Double)
+        -> (fill: CGFloat, stroke: (alpha: CGFloat, width: CGFloat)?) {
+        let base: CGFloat = name == "CLAUDE" ? 0.09 : 0.08
+        let blinkOn = Int(t * 2) % 2 == 0
+        let phase = t.truncatingRemainder(dividingBy: 5) / 5        // 0..1
+        let breath = CGFloat(phase < 0.5 ? phase * 2 : (1 - phase) * 2)
+        if usage.needsAttention {
+            return (blinkOn ? 0.36 : 0.10, (blinkOn ? 0.9 : 0.25, 2))
+        }
+        if usage.isWorking {
+            // Faint breathing border to reinforce the "alive/working" feel
+            return (base + 0.13 * breath, (0.12 + 0.28 * breath, 1.5))
+        }
+        return (base, nil)
+    }
+
+    /// Blit the tint from pre-rendered shape sprites with a global alpha —
+    /// rasterizing the two big rounded rects as paths every frame cost ~6% CPU.
+    /// The shape is symmetric, so drawing it into the flipped context is safe.
+    /// Internal (not private) so tests can compare it against paintColumnTint.
+    func renderColumnTint(_ ctx: CGContext, x: Int, w: Int, py: Int,
+                          name: String, accent: CGColor, usage: AgentUsage,
+                          t: Double) {
+        let (fillAlpha, stroke) = tintPhase(name: name, usage: usage, t: t)
+        guard let fill = tintSprite(name: name, accent: accent, strokeWidth: nil, w: w) else {
+            paintColumnTint(ctx, x: x, w: w, py: py, name: name, accent: accent,
+                            usage: usage, t: t)
+            return
+        }
+        // Sprite canvas = bgRect plus a 2px margin so the border's AA isn't clipped
+        let ph = Layout.panelHeight
+        let canvas = CGRect(x: CGFloat(x - 12 - 2), y: CGFloat(py + 42 - 2),
+                            width: CGFloat(w + 24 + 4), height: CGFloat(ph - 56 + 4))
+        ctx.saveGState()
+        ctx.setAlpha(fillAlpha)
+        ctx.draw(fill, in: canvas)
+        ctx.restoreGState()
+        if let stroke,
+           let border = tintSprite(name: name, accent: accent,
+                                   strokeWidth: stroke.width, w: w) {
+            ctx.saveGState()
+            ctx.setAlpha(stroke.alpha)
+            ctx.draw(border, in: canvas)
+            ctx.restoreGState()
+        }
+    }
+
+    /// Sprites keyed by column and stroke width; two columns × fill/two borders.
+    private var tintSprites: [String: CGImage] = [:]
+
+    private func tintSprite(name: String, accent: CGColor, strokeWidth: CGFloat?,
+                            w: Int) -> CGImage? {
+        let key = strokeWidth.map { "\(name)-stroke-\($0)" } ?? "\(name)-fill"
+        if let hit = tintSprites[key] { return hit }
+        let ph = Layout.panelHeight
+        let cw = w + 24 + 4, ch = ph - 56 + 4
+        guard let c = CGContext(data: nil, width: cw, height: ch,
+                                bitsPerComponent: 8, bytesPerRow: cw * 4,
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let path = CGPath(roundedRect: CGRect(x: 2, y: 2, width: CGFloat(w + 24),
+                                              height: CGFloat(ph - 56)),
+                          cornerWidth: 12, cornerHeight: 12, transform: nil)
+        if let strokeWidth {
+            c.setStrokeColor(accent)
+            c.setLineWidth(strokeWidth)
+            c.addPath(path)
+            c.strokePath()
+        } else {
+            c.setFillColor(accent)
+            c.addPath(path)
+            c.fillPath()
+        }
+        let image = c.makeImage()
+        if let image { tintSprites[key] = image }
+        return image
+    }
+
+    /// The direct path-fill tint the sprites are checked against in tests.
+    func paintColumnTint(_ ctx: CGContext, x: Int, w: Int, py: Int,
+                         name: String, accent: CGColor, usage: AgentUsage,
+                         t: Double) {
         let ph = Layout.panelHeight
         let bgRect = CGRect(x: CGFloat(x - 12), y: CGFloat(py + 42),
                             width: CGFloat(w + 24), height: CGFloat(ph - 56))
         let bgPath = CGPath(roundedRect: bgRect, cornerWidth: 12, cornerHeight: 12,
                             transform: nil)
-        let base: CGFloat = name == "CLAUDE" ? 0.09 : 0.08
-        let blinkOn = Int(t * 2) % 2 == 0
-        // Linear triangle breathing (0→1→0 over 5s). A constant per-frame delta reads
-        // far smoother than cosine easing at the display's low frame rate — no stutter
-        // where the cosine flattens near its peaks/troughs.
-        let phase = t.truncatingRemainder(dividingBy: 5) / 5        // 0..1
-        let breath = CGFloat(phase < 0.5 ? phase * 2 : (1 - phase) * 2)
-        var bgAlpha = base
-        if usage.needsAttention {
-            bgAlpha = blinkOn ? 0.36 : 0.10
-        } else if usage.isWorking {
-            bgAlpha = base + 0.13 * breath
-        }
-        ctx.setFillColor(accent.copy(alpha: bgAlpha) ?? accent)
+        let (fillAlpha, stroke) = tintPhase(name: name, usage: usage, t: t)
+        ctx.setFillColor(accent.copy(alpha: fillAlpha) ?? accent)
         ctx.addPath(bgPath)
         ctx.fillPath()
-        if usage.needsAttention {
-            ctx.setStrokeColor(accent.copy(alpha: blinkOn ? 0.9 : 0.25) ?? accent)
-            ctx.setLineWidth(2)
-            ctx.addPath(bgPath)
-            ctx.strokePath()
-        } else if usage.isWorking {
-            // Faint breathing border to reinforce the "alive/working" feel
-            ctx.setStrokeColor(accent.copy(alpha: 0.12 + 0.28 * breath) ?? accent)
-            ctx.setLineWidth(1.5)
+        if let stroke {
+            ctx.setStrokeColor(accent.copy(alpha: stroke.alpha) ?? accent)
+            ctx.setLineWidth(stroke.width)
             ctx.addPath(bgPath)
             ctx.strokePath()
         }
