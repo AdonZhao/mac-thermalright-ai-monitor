@@ -91,8 +91,12 @@ enum JPEGEncoder {
         return data as Data
     }
 
-    // Reusable context for the brightness multiply — same leak-avoidance as rotateCtx
+    // Reusable context for the brightness multiply — same leak-avoidance as
+    // rotateCtx. Locked: the buffer is drawn into and multiplied in place, so
+    // two concurrent callers (parallel tests today, any second caller tomorrow)
+    // corrupt each other's pixels.
     nonisolated(unsafe) private static var brightnessCtx: CGContext?
+    private static let brightnessLock = NSLock()
 
     /// Apply brightness — matches Python ImageEnhance.Brightness behavior: multiply
     /// the stored RGB values by factor, saturating at 255, alpha untouched.
@@ -105,6 +109,8 @@ enum JPEGEncoder {
         if factor <= 1.0 { return image }
 
         let w = image.width, h = image.height
+        brightnessLock.lock()
+        defer { brightnessLock.unlock() }
         if let ctx = brightnessCtx, ctx.width != w || ctx.height != h {
             brightnessCtx = nil
         }
