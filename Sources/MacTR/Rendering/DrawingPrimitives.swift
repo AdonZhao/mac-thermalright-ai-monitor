@@ -13,7 +13,38 @@ enum Draw {
 
     /// Draw vertical gradient background.
     /// In flipped context: Y=0 is top, so bgTop at y=0, bgBot at y=height.
+    ///
+    /// Blits a pre-rendered image: the gradient never changes, but painting it
+    /// directly shades every pixel per call, which cost ~12% of the frame
+    /// thread at 15fps. `static let` gives one-time, thread-safe rendering.
     static func gradientBackground(_ ctx: CGContext) {
+        guard let image = backgroundImage else {
+            paintGradientBackground(ctx)
+            return
+        }
+        ctx.saveGState()
+        // Undo flip so the image isn't drawn mirrored (draw() uses native CG coords)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: 0, y: -CGFloat(Layout.height))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: Layout.width, height: Layout.height))
+        ctx.restoreGState()
+    }
+
+    static let backgroundImage: CGImage? = {
+        guard let ctx = CGContext(
+            data: nil, width: Layout.width, height: Layout.height,
+            bitsPerComponent: 8, bytesPerRow: Layout.width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.translateBy(x: 0, y: CGFloat(Layout.height))
+        ctx.scaleBy(x: 1, y: -1)
+        paintGradientBackground(ctx)
+        return ctx.makeImage()
+    }()
+
+    /// The direct (per-pixel) painting `backgroundImage` is rendered from.
+    static func paintGradientBackground(_ ctx: CGContext) {
         let colors = [Color.bgTop, Color.bgBot] as CFArray
         guard let gradient = CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
