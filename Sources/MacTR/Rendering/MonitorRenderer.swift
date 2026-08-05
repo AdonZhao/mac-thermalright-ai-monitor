@@ -40,21 +40,69 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     // animated tints (they sit UNDER the column text, hence the separate columns
     // layer), blits columns, then draws Pikachu / Bongo Cat / the clock on top.
     // All guarded by renderMutex, like reusableCtx.
-    private struct LayerKey: Equatable {
+    //
+    // The two layers invalidate independently: system metrics jitter every
+    // 0.5s and must not re-layout the agent text (the expensive part), and an
+    // agent update must not repaint the gauges. The columns key holds what the
+    // columns actually DISPLAY — time-derived values enter as their formatted
+    // strings, so a seconds tick that still reads "now" changes nothing.
+    private struct StaticKey: Equatable {
         let cpu: CPUSnapshot
         let mem: MemorySnapshot
         let temp: TemperatureSnapshot
         let sys: SystemSnapshot?
-        let agents: AgentsSnapshot
+    }
+
+    private struct ColumnDisplayKey: Equatable {
+        let available: Bool
+        let project: String?
+        let activity: String?
+        let model: String?
+        let waitingFor: String?
+        let agoText: String
+        let agoActive: Bool
+        let stepCurrent: Int?
+        let stepTotal: Int?
+        let tokensTotal: String
+        let tokensIn: String
+        let tokensOut: String
+        // NOT quantized: the quota bar draws this at sub-percent precision
+        let quotaPercent: Double?
+        let quotaResetText: String?
+
+        init(_ u: AgentUsage) {
+            available = u.available
+            project = u.project
+            activity = u.activity
+            model = u.model
+            waitingFor = u.waitingFor
+            (agoText, agoActive) = MonitorRenderer.agoDisplay(u)
+            stepCurrent = u.stepCurrent
+            stepTotal = u.stepTotal
+            tokensTotal = MonitorRenderer.formatTokensCN(u.todayTotalTokens)
+            tokensIn = MonitorRenderer.formatTokensCN(u.todayInputTokens)
+            tokensOut = MonitorRenderer.formatTokensCN(u.todayOutputTokens)
+            quotaPercent = u.quotaUsedPercent
+            quotaResetText = u.quotaResetsAt.map {
+                MonitorRenderer.quotaResetDisplay(secondsUntilReset: max(0, Int($0.timeIntervalSinceNow)))
+            }
+        }
+    }
+
+    private struct ColumnsKey: Equatable {
+        let claude: ColumnDisplayKey
+        let codex: ColumnDisplayKey
     }
 
     private var staticCtx: CGContext?
     private var columnsCtx: CGContext?
     private var staticBase: CGImage?
     private var columnsImage: CGImage?
-    private var cachedLayerKey: LayerKey?
-    /// How many times the static layers were re-rendered — observability for tests.
+    private var cachedStaticKey: StaticKey?
+    private var cachedColumnsKey: ColumnsKey?
+    /// Rebuild counts — observability for tests.
     private(set) var staticLayerRebuilds = 0
+    private(set) var columnsRebuilds = 0
 
     // Shared date/clock formatting. DateFormatter creation is expensive and the
     // animated pass used to build three per frame at 15fps for strings that
@@ -309,9 +357,14 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     func composeLayeredFrame(_ ctx: CGContext, cpu: CPUSnapshot, mem: MemorySnapshot,
                              temp: TemperatureSnapshot, sys: SystemSnapshot?,
                              agents: AgentsSnapshot, t: Double) {
-        let key = LayerKey(cpu: cpu, mem: mem, temp: temp, sys: sys, agents: agents)
-        if key != cachedLayerKey || staticBase == nil || columnsImage == nil {
-            rebuildStaticLayers(key: key, t: t)
+        let staticKey = StaticKey(cpu: cpu, mem: mem, temp: temp, sys: sys)
+        if staticKey != cachedStaticKey || staticBase == nil {
+            rebuildStaticBase(key: staticKey, t: t)
+        }
+        let columnsKey = ColumnsKey(claude: ColumnDisplayKey(agents.claude),
+                                    codex: ColumnDisplayKey(agents.codex))
+        if columnsKey != cachedColumnsKey || columnsImage == nil {
+            rebuildColumns(agents: agents, key: columnsKey)
         }
 
         let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
@@ -329,10 +382,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         renderMemoryAnimated(ctx, agentsBusy: agentsBusy, t: t)
     }
 
-    private func rebuildStaticLayers(key: LayerKey, t: Double) {
+    private func rebuildStaticBase(key: StaticKey, t: Double) {
         if staticCtx == nil { staticCtx = Self.makeLayerContext() }
-        if columnsCtx == nil { columnsCtx = Self.makeLayerContext() }
-        guard let sctx = staticCtx, let cctx = columnsCtx else { return }
+        guard let sctx = staticCtx else { return }
 
         sctx.saveGState()
         sctx.translateBy(x: 0, y: CGFloat(Layout.height))
@@ -344,6 +396,14 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         staticBase = sctx.makeImage()
         sctx.restoreGState()
 
+        cachedStaticKey = key
+        staticLayerRebuilds += 1
+    }
+
+    private func rebuildColumns(agents: AgentsSnapshot, key: ColumnsKey) {
+        if columnsCtx == nil { columnsCtx = Self.makeLayerContext() }
+        guard let cctx = columnsCtx else { return }
+
         // Transparent layer: clear in identity coords, then draw flipped
         cctx.clear(CGRect(x: 0, y: 0, width: Layout.width, height: Layout.height))
         cctx.saveGState()
@@ -351,15 +411,15 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         cctx.scaleBy(x: 1, y: -1)
         renderColumnContent(cctx, x: AgentsLayout.claudeX, w: AgentsLayout.colW,
                             py: Layout.panelY, name: "CLAUDE", accent: Color.claude,
-                            usage: key.agents.claude)
+                            usage: agents.claude)
         renderColumnContent(cctx, x: AgentsLayout.codexX, w: AgentsLayout.colW,
                             py: Layout.panelY, name: "CODEX", accent: Color.cyan,
-                            usage: key.agents.codex)
+                            usage: agents.codex)
         columnsImage = cctx.makeImage()
         cctx.restoreGState()
 
-        cachedLayerKey = key
-        staticLayerRebuilds += 1
+        cachedColumnsKey = key
+        columnsRebuilds += 1
     }
 
     private static func makeLayerContext() -> CGContext? {
@@ -881,17 +941,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         // Header: name + activity indicator (right-aligned "● now" / "12m ago")
         Draw.text(ctx, name, x: x, y: py + 50,
                   font: Fonts.system(24, weight: .bold), color: accent)
-        let active = (usage.secondsSinceActive ?? Int.max) < 90
-        let agoStr: String
-        if !usage.available {
-            agoStr = "not found"
-        } else if let s = usage.secondsSinceActive {
-            agoStr = active ? "now"
-                : (s < 3600 ? "\(s / 60)m ago"
-                   : (s < 86400 ? "\(s / 3600)h ago" : "\(s / 86400)d ago"))
-        } else {
-            agoStr = "no session"
-        }
+        let (agoStr, active) = MonitorRenderer.agoDisplay(usage)
         let agoFont = Fonts.system(17, weight: .medium)
         let agoColor = active ? Color.green : Color.textD
         let agoW = (agoStr as NSString).size(withAttributes: [.font: agoFont]).width
@@ -980,7 +1030,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
         Draw.text(ctx, "今日 Token", x: x, y: tokY,
                   font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+        Draw.text(ctx, MonitorRenderer.formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
                   font: Fonts.system(46, weight: .bold), color: Color.textW)
 
         // In / Out — right-aligned, level with the label + big number
@@ -991,7 +1041,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ]
         for (i, row) in ioRows.enumerated() {
             let ry = tokY + 6 + i * 30
-            let valStr = formatTokensCN(row.1)
+            let valStr = MonitorRenderer.formatTokensCN(row.1)
             let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
             Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
                       font: ioFont, color: Color.textS)
@@ -1009,9 +1059,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
                       font: Fonts.system(21, weight: .medium), color: qColor)
             if let resets = usage.quotaResetsAt {
-                let secs = max(0, Int(resets.timeIntervalSinceNow))
-                let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
-                    : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
+                let resetStr = MonitorRenderer.quotaResetDisplay(
+                    secondsUntilReset: max(0, Int(resets.timeIntervalSinceNow)))
                 let rFont = Fonts.system(17)
                 let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
                 Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
@@ -1046,8 +1095,26 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         }
     }
 
+    /// The header's activity indicator text and whether it counts as active.
+    /// Shared by drawing and the columns cache key so they can't disagree.
+    static func agoDisplay(_ usage: AgentUsage) -> (text: String, active: Bool) {
+        let active = (usage.secondsSinceActive ?? Int.max) < 90
+        if !usage.available { return ("not found", active) }
+        guard let s = usage.secondsSinceActive else { return ("no session", active) }
+        if active { return ("now", active) }
+        let text = s < 3600 ? "\(s / 60)m ago"
+            : (s < 86400 ? "\(s / 3600)h ago" : "\(s / 86400)d ago")
+        return (text, active)
+    }
+
+    /// Quota reset countdown text — shared by drawing and the columns cache key.
+    static func quotaResetDisplay(secondsUntilReset secs: Int) -> String {
+        secs >= 86400 ? "\(secs / 86400)天后重置"
+            : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
+    }
+
     /// 中文数量格式："33.99万"、"1.02亿"。1万以下显示原始数字。
-    private func formatTokensCN(_ n: UInt64) -> String {
+    private static func formatTokensCN(_ n: UInt64) -> String {
         let v = Double(n)
         if v >= 1e8 {
             let y = v / 1e8

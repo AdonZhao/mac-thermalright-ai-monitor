@@ -174,6 +174,75 @@ private func agentsPair(_ claude: AgentUsage, _ codex: AgentUsage) -> AgentsSnap
         #expect(renderer.staticLayerRebuilds == 2)
     }
 
+    @Test("a CPU change rebuilds the base but does not re-layout the agent columns")
+    func cpuChangeDoesNotRebuildColumns() throws {
+        let renderer = MonitorRenderer()
+        let agents = agentsPair(workingUsage, idleUsage)
+        let ctx = try #require(makeContext())
+
+        renderer.composeLayeredFrame(ctx, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agents, t: t0)
+        renderer.composeLayeredFrame(ctx, cpu: cpuB, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agents, t: t0 + 0.5)
+
+        #expect(renderer.staticLayerRebuilds == 2)
+        #expect(renderer.columnsRebuilds == 1)
+    }
+
+    @Test("an agent activity change rebuilds the columns but not the base")
+    func agentChangeDoesNotRebuildBase() throws {
+        let renderer = MonitorRenderer()
+        let ctx = try #require(makeContext())
+
+        renderer.composeLayeredFrame(ctx, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agentsPair(workingUsage, idleUsage), t: t0)
+        var changed = workingUsage
+        changed = AgentUsage(
+            available: true, todayInputTokens: changed.todayInputTokens,
+            todayOutputTokens: changed.todayOutputTokens,
+            secondsSinceActive: changed.secondsSinceActive, project: changed.project,
+            activity: "换了一条新的活动消息", isWorking: true,
+            model: changed.model, stepCurrent: changed.stepCurrent,
+            stepTotal: changed.stepTotal)
+        renderer.composeLayeredFrame(ctx, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agentsPair(changed, idleUsage), t: t0 + 0.5)
+
+        #expect(renderer.staticLayerRebuilds == 1)
+        #expect(renderer.columnsRebuilds == 2)
+    }
+
+    @Test("a seconds-since-active tick with the same display text skips the rebuild")
+    func displayEquivalentAgentTickSkipsRebuild() throws {
+        let renderer = MonitorRenderer()
+        let ctx = try #require(makeContext())
+
+        // 5s and 7s both display as "now" (< 90s) — no visible difference
+        let atFive = workingUsage
+        let atSeven = AgentUsage(
+            available: true, todayInputTokens: atFive.todayInputTokens,
+            todayOutputTokens: atFive.todayOutputTokens,
+            secondsSinceActive: 7, project: atFive.project,
+            activity: atFive.activity, isWorking: true,
+            model: atFive.model, stepCurrent: atFive.stepCurrent,
+            stepTotal: atFive.stepTotal)
+
+        renderer.composeLayeredFrame(ctx, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agentsPair(atFive, idleUsage), t: t0)
+        renderer.composeLayeredFrame(ctx, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agentsPair(atSeven, idleUsage), t: t0 + 0.5)
+        #expect(renderer.columnsRebuilds == 1)
+
+        // and the cached columns must still match drawing the new data directly
+        let direct = try #require(makeContext())
+        let layered = try #require(makeContext())
+        renderer.renderScene(direct, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                             agents: agentsPair(atSeven, idleUsage), t: t0 + 0.5)
+        renderer.composeLayeredFrame(layered, cpu: cpuA, mem: memA, temp: tempA, sys: sysA,
+                                     agents: agentsPair(atSeven, idleUsage), t: t0 + 0.5)
+        let stats = diffStats(pixels(direct), pixels(layered))
+        #expect(stats.acceptable, Comment(rawValue: stats.description))
+    }
+
     @Test("animation keeps moving between frames with identical data")
     func animationMovesWithoutDataChange() throws {
         let renderer = MonitorRenderer()
