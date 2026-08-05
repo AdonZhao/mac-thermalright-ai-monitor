@@ -12,6 +12,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     private let collector = SystemMetricsCollector()
     private let agentCollector = AgentUsageCollector()
+    private let textWrapper = TextWrapper()
 
     // Background metrics collection — decoupled from frame loop for consistent refresh
     private let metricsQueue = DispatchQueue(label: "com.thermalvision.metrics")
@@ -772,8 +773,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                           font: bFont, color: accent)
                 projMaxW = CGFloat(w) - bW - 16
             }
-            Draw.text(ctx, truncate(project, font: Fonts.system(26, weight: .semibold),
-                                    maxW: projMaxW),
+            Draw.text(ctx, textWrapper.truncate(project, font: Fonts.system(26, weight: .semibold),
+                                                maxW: projMaxW),
                       x: x, y: y, font: Fonts.system(26, weight: .semibold), color: Color.textW)
             y += 38
         }
@@ -925,8 +926,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                 let remaining = (bottom - cy) / lineH
                 guard remaining > 0 else { break }
                 let cap = max(2, remaining - reserve[i + 1])
-                let wrapped = wrap(stripMarkdown(line), font: proseFont,
-                                   maxW: CGFloat(w), maxLines: min(cap, remaining))
+                let wrapped = textWrapper.wrap(stripMarkdown(line), font: proseFont,
+                                               maxW: CGFloat(w), maxLines: min(cap, remaining))
                 for wl in wrapped {
                     if cy + lineH > bottom { break }
                     Draw.text(ctx, wl, x: x, y: cy, font: proseFont, color: Color.textS)
@@ -984,7 +985,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                 let cx = x + ci * (colW + colGap)
                 let font = ri == 0 ? headFont : cellFont
                 let color = ri == 0 ? accent : Color.textS
-                Draw.text(ctx, truncate(cell, font: font, maxW: CGFloat(colW)),
+                Draw.text(ctx, textWrapper.truncate(cell, font: font, maxW: CGFloat(colW)),
                           x: cx, y: cy, font: font, color: color)
             }
             cy += rowH
@@ -996,43 +997,5 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         return cy + 4
     }
 
-    /// Truncate a single line with "…" to fit maxW.
-    private func truncate(_ s: String, font: NSFont, maxW: CGFloat) -> String {
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        if (s as NSString).size(withAttributes: attrs).width <= maxW { return s }
-        var t = s
-        while !t.isEmpty {
-            t.removeLast()
-            if ((t + "…") as NSString).size(withAttributes: attrs).width <= maxW {
-                return t + "…"
-            }
-        }
-        return "…"
-    }
-
-    /// Greedy character wrap (activity text may be CJK — no word boundaries).
-    private func wrap(_ s: String, font: NSFont, maxW: CGFloat, maxLines: Int) -> [String] {
-        guard maxLines >= 1 else { return [] }
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        var lines: [String] = []
-        var current = ""
-        for ch in s {
-            let candidate = current + String(ch)
-            if (candidate as NSString).size(withAttributes: attrs).width > maxW {
-                // Reached the last allowed line → fold the whole remainder into it
-                if lines.count == maxLines - 1 {
-                    let rest = String(s[s.index(s.startIndex, offsetBy: lines.joined().count)...])
-                    lines.append(truncate(rest, font: font, maxW: maxW))
-                    return lines
-                }
-                lines.append(current)
-                current = String(ch)
-            } else {
-                current = candidate
-            }
-        }
-        if !current.isEmpty { lines.append(current) }
-        return lines
-    }
 
 }
