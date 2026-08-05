@@ -23,6 +23,26 @@ struct EngineStatus: Sendable {
     let lastFrameSize: Int
 }
 
+/// Decides whether a status update is worth posting to the main thread.
+/// State transitions (connected/connecting/message) always pass; pure
+/// frame-statistics updates — the 15fps "still Active" after every sent
+/// frame, only frameCount/lastFrameSize ticking — are limited to 1/s so the
+/// frame loop stops scheduling MainActor work per frame.
+struct StatusThrottle {
+    private var lastState: (connected: Bool, connecting: Bool, message: String)?
+    private var lastPostedAt: Double = -.infinity
+
+    mutating func shouldPost(connected: Bool, connecting: Bool, message: String,
+                             now: Double) -> Bool {
+        let state = (connected, connecting, message)
+        let changed = lastState.map { $0 != state } ?? true
+        guard changed || now - lastPostedAt >= 1.0 else { return false }
+        lastState = state
+        lastPostedAt = now
+        return true
+    }
+}
+
 // MARK: - Display Engine (runs entirely off main thread)
 
 final class DisplayEngine: @unchecked Sendable {
@@ -339,10 +359,17 @@ final class DisplayEngine: @unchecked Sendable {
         }
     }
 
+    // usbQueue-confined, like the frame loop that drives it
+    private var statusThrottle = StatusThrottle()
+
     private func postStatus(
         connected: Bool, connecting: Bool = false,
         deviceInfo: DeviceInfo? = nil, message: String
     ) {
+        guard statusThrottle.shouldPost(connected: connected, connecting: connecting,
+                                        message: message,
+                                        now: Date().timeIntervalSince1970)
+        else { return }
         let status = EngineStatus(
             connected: connected,
             connecting: connecting,
