@@ -94,6 +94,22 @@ extension SystemSnapshot: Equatable {}
 final class SystemMetricsCollector: @unchecked Sendable {
 
     // Previous CPU ticks for delta calculation
+    // Hardware facts that cannot change while the process runs — read once
+    // instead of re-querying sysctl every 0.5s tick.
+    private let pCoresSysctl: Int32 = {
+        var v: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        sysctlbyname("hw.perflevel0.logicalcpu", &v, &size, nil, 0)
+        return v  // 0 on Intel — collectCPU falls back to the core count
+    }()
+    private let totalRAM: UInt64 = {
+        var v: UInt64 = 0
+        var size = MemoryLayout<UInt64>.size
+        sysctlbyname("hw.memsize", &v, &size, nil, 0)
+        return v
+    }()
+    private let pageSize = UInt64(getpagesize())
+
     private var prevTicks: [(user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)] = []
 
     // Previous network bytes for delta calculation
@@ -170,12 +186,8 @@ final class SystemMetricsCollector: @unchecked Sendable {
         var loadavg: [Double] = [0, 0, 0]
         getloadavg(&loadavg, 3)
 
-        // P-core count via sysctl (Apple Silicon)
-        var pCores: Int32 = 0
-        var pSize = MemoryLayout<Int32>.size
-        sysctlbyname("hw.perflevel0.logicalcpu", &pCores, &pSize, nil, 0)
-        // If sysctl fails (Intel), assume all cores are P-cores
-        let pCount = pCores > 0 ? Int(pCores) : perCore.count
+        // If the P-core sysctl failed at init (Intel), assume all cores are P-cores
+        let pCount = pCoresSysctl > 0 ? Int(pCoresSysctl) : perCore.count
 
         return CPUSnapshot(
             perCore: perCore, total: total,
@@ -196,19 +208,12 @@ final class SystemMetricsCollector: @unchecked Sendable {
             }
         }
 
-        let pageSize = UInt64(getpagesize())
-
         guard result == KERN_SUCCESS else {
             return MemorySnapshot(total: 0, active: 0, wired: 0, compressed: 0,
                                   available: 0, swapUsed: 0, swapTotal: 0,
                                   swapInPerSec: 0, swapOutPerSec: 0, swapAvailable: false,
                                   pressure: 1)
         }
-
-        // Total RAM via sysctl
-        var totalRAM: UInt64 = 0
-        var size = MemoryLayout<UInt64>.size
-        sysctlbyname("hw.memsize", &totalRAM, &size, nil, 0)
 
         let active = UInt64(stats.active_count) * pageSize
         let wired = UInt64(stats.wire_count) * pageSize
