@@ -56,6 +56,42 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
     /// How many times the static layers were re-rendered — observability for tests.
     private(set) var staticLayerRebuilds = 0
 
+    // Shared date/clock formatting. DateFormatter creation is expensive and the
+    // animated pass used to build three per frame at 15fps for strings that
+    // change once a second (clock) or once a day (date). Locked because render()
+    // (USB queue) and renderScene() (main-thread preview) both format.
+    private let formatterLock = NSLock()
+    private var clockCache: (second: Int, string: String)?
+    private let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    private let weekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "EEEE"
+        return f
+    }()
+
+    /// "HH:mm:ss" for t, cached per whole second. Internal for tests.
+    func clockString(t: Double) -> String {
+        let second = Int(t)
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
+        if let cached = clockCache, cached.second == second { return cached.string }
+        let string = clockFormatter.string(from: Date(timeIntervalSince1970: t))
+        clockCache = (second, string)
+        return string
+    }
+
     // Test mode (--test-flash): force both columns into the flashing state until
     // this deadline, to preview the alert visuals without waiting for a real event
     private var testFlashUntil: Date?
@@ -649,15 +685,15 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: cx0 + cw, y: dividerY), color: Color.border)
 
         // Right of the cat: date, weekday, uptime, processes
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US")
         let date = Date(timeIntervalSince1970: t)
+        formatterLock.lock()
+        let dateStr = dateFormatter.string(from: date)
+        let weekdayStr = weekdayFormatter.string(from: date)
+        formatterLock.unlock()
         let ix = x + 190
-        formatter.dateFormat = "yyyy-MM-dd"
-        Draw.text(ctx, formatter.string(from: date), x: ix, y: py + ph - 196,
+        Draw.text(ctx, dateStr, x: ix, y: py + ph - 196,
                   font: Fonts.system(22, weight: .semibold), color: Color.textW)
-        formatter.dateFormat = "EEEE"
-        Draw.text(ctx, formatter.string(from: date), x: ix, y: py + ph - 170,
+        Draw.text(ctx, weekdayStr, x: ix, y: py + ph - 170,
                   font: Fonts.system(16), color: Color.textS)
 
         let iw = pw - (ix - x) - 16
@@ -689,10 +725,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         drawBongoCat(ctx, cx: x + 96, baseY: dividerY, tapping: agentsBusy, phase: tapPhase)
 
         // Clock — big, centered across the full panel width, below the divider
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US")
-        formatter.dateFormat = "HH:mm:ss"
-        Draw.centeredText(ctx, formatter.string(from: Date(timeIntervalSince1970: t)),
+        Draw.centeredText(ctx, clockString(t: t),
                           cx: x + pw / 2, y: dividerY + 30,
                           font: Fonts.system(66, weight: .medium), color: Color.textW)
     }
