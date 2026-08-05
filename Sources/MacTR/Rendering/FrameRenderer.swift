@@ -3,8 +3,8 @@
 // Each display set implements this protocol.
 // The frame loop calls render() to get a CGImage, then encodes it to JPEG.
 
+import Accelerate
 import CoreGraphics
-import CoreImage
 import Foundation
 import ImageIO
 
@@ -91,30 +91,49 @@ enum JPEGEncoder {
         return data as Data
     }
 
-    // Reusable CIContext for brightness filter
-    nonisolated(unsafe) private static var ciCtx: CIContext?
+    // Reusable context for the brightness multiply — same leak-avoidance as rotateCtx
+    nonisolated(unsafe) private static var brightnessCtx: CGContext?
 
-    /// Apply brightness using CIFilter — matches Python ImageEnhance.Brightness behavior.
-    /// PIL Brightness multiplies RGB values by factor. CIFilter.colorControls brightness
-    /// parameter is additive (-1 to 1), so we use a combination approach.
-    private static func applyBrightness(_ image: CGImage, level: Int) -> CGImage? {
+    /// Apply brightness — matches Python ImageEnhance.Brightness behavior: multiply
+    /// the stored RGB values by factor, saturating at 255, alpha untouched.
+    /// One SIMD pass over the bitmap; the CoreImage filter graph this replaces cost
+    /// ~10% of the frame thread per frame and, multiplying in linear color space,
+    /// came out darker than the PIL semantics it claimed.
+    /// Internal (not private) so tests can pin the multiply-and-clamp semantics.
+    static func applyBrightness(_ image: CGImage, level: Int) -> CGImage? {
         let factor = Brightness.factor(for: level)
         if factor <= 1.0 { return image }
 
-        let ciImage = CIImage(cgImage: image)
+        let w = image.width, h = image.height
+        if let ctx = brightnessCtx, ctx.width != w || ctx.height != h {
+            brightnessCtx = nil
+        }
+        if brightnessCtx == nil {
+            brightnessCtx = CGContext(
+                data: nil, width: w, height: h,
+                bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        }
+        guard let ctx = brightnessCtx, let data = ctx.data else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
 
-        // Use colorMatrix to multiply RGB by factor (same as PIL Brightness)
-        guard let filter = CIFilter(name: "CIColorMatrix") else { return nil }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        let f = Float(factor)
-        filter.setValue(CIVector(x: CGFloat(f), y: 0, z: 0, w: 0), forKey: "inputRVector")
-        filter.setValue(CIVector(x: 0, y: CGFloat(f), z: 0, w: 0), forKey: "inputGVector")
-        filter.setValue(CIVector(x: 0, y: 0, z: CGFloat(f), w: 0), forKey: "inputBVector")
-        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
-        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputBiasVector")
+        var buffer = vImage_Buffer(data: data, height: vImagePixelCount(h),
+                                   width: vImagePixelCount(w), rowBytes: ctx.bytesPerRow)
+        // Fixed-point diagonal matrix: RGB × factor, alpha × 1, all over divisor 256
+        let divisor: Int32 = 256
+        let f = Int16((factor * CGFloat(divisor)).rounded())
+        let matrix: [Int16] = [
+            f, 0, 0, 0,
+            0, f, 0, 0,
+            0, 0, f, 0,
+            0, 0, 0, Int16(divisor),
+        ]
+        guard vImageMatrixMultiply_ARGB8888(&buffer, &buffer, matrix, divisor,
+                                            nil, nil, vImage_Flags(kvImageNoFlags))
+            == kvImageNoError
+        else { return nil }
 
-        guard let output = filter.outputImage else { return nil }
-        if ciCtx == nil { ciCtx = CIContext() }
-        return ciCtx!.createCGImage(output, from: output.extent)
+        return ctx.makeImage()
     }
 }
