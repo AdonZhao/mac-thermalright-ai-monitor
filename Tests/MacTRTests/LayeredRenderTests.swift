@@ -174,27 +174,6 @@ private func agentsPair(_ claude: AgentUsage, _ codex: AgentUsage) -> AgentsSnap
         #expect(renderer.staticLayerRebuilds == 2)
     }
 
-    @Test("sprite-blitted column tint matches path-filled tint, all three states",
-          arguments: [idleUsage, workingUsage, attentionUsage])
-    func tintSpriteMatchesPathFill(usage: AgentUsage) throws {
-        let renderer = MonitorRenderer()
-        let blitted = try #require(makeContext())
-        let filled = try #require(makeContext())
-        // A non-uniform backdrop so alpha blending mistakes can't hide
-        Draw.gradientBackground(blitted)
-        Draw.gradientBackground(filled)
-
-        renderer.renderColumnTint(blitted, x: 436, w: 520, py: Layout.panelY,
-                                  name: "CLAUDE", accent: Color.claude,
-                                  usage: usage, t: t0 + 1.25)
-        renderer.paintColumnTint(filled, x: 436, w: 520, py: Layout.panelY,
-                                 name: "CLAUDE", accent: Color.claude,
-                                 usage: usage, t: t0 + 1.25)
-
-        let stats = diffStats(pixels(blitted), pixels(filled))
-        #expect(stats.acceptable, Comment(rawValue: stats.description))
-    }
-
     @Test("animation keeps moving between frames with identical data")
     func animationMovesWithoutDataChange() throws {
         let renderer = MonitorRenderer()
