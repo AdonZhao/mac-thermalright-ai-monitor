@@ -145,13 +145,23 @@ enum LYProtocol {
     }
 
     /// Send one JPEG frame using LY chunked bulk protocol.
+    /// How many 512-byte chunks a frame needs and how much payload the last
+    /// one carries. `totalSize / 496 + 1` used to add an EMPTY chunk whenever
+    /// the JPEG was an exact multiple of 496. An empty frame keeps the
+    /// historical single empty chunk (the device treats it as a frame marker).
+    static func chunkLayout(totalSize: Int) -> (count: Int, lastDataLen: Int) {
+        guard totalSize > 0 else { return (1, 0) }
+        let count = (totalSize + chunkDataSize - 1) / chunkDataSize
+        let remainder = totalSize % chunkDataSize
+        return (count, remainder == 0 ? chunkDataSize : remainder)
+    }
+
     static func sendFrame(device: USBDevice, jpegData: Data) throws {
         let pid = device.pid
         let chunkCmd: UInt8 = (pid == 0x5408) ? 0x01 : 0x02
 
         let totalSize = jpegData.count
-        let numChunks = totalSize / chunkDataSize + 1
-        let lastChunkData = totalSize % chunkDataSize
+        let (numChunks, lastChunkData) = chunkLayout(totalSize: totalSize)
 
         // Build all 512-byte chunks
         var chunks = Data(count: numChunks * chunkSize)
