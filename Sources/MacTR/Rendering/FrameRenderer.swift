@@ -98,15 +98,16 @@ enum JPEGEncoder {
     nonisolated(unsafe) private static var brightnessCtx: CGContext?
     private static let brightnessLock = NSLock()
 
-    /// Apply brightness — matches Python ImageEnhance.Brightness behavior: multiply
-    /// the stored RGB values by factor, saturating at 255, alpha untouched.
-    /// One SIMD pass over the bitmap; the CoreImage filter graph this replaces cost
-    /// ~10% of the frame thread per frame and, multiplying in linear color space,
-    /// came out darker than the PIL semantics it claimed.
-    /// Internal (not private) so tests can pin the multiply-and-clamp semantics.
+    /// Apply brightness: decode sRGB to linear light, multiply by factor,
+    /// encode back, saturating at 1.0 — the exact curve the original CoreImage
+    /// colorMatrix path produced. That curve is the contract: users calibrated
+    /// their brightness levels against it, and a stored-value multiply reads
+    /// several levels brighter (level 8 washes Pikachu's yellow to white).
+    /// The whole decode→multiply→encode is baked into a per-level 256-entry
+    /// table, applied in one SIMD pass over a reused bitmap.
+    /// Internal (not private) so tests can pin the curve with known pixels.
     static func applyBrightness(_ image: CGImage, level: Int) -> CGImage? {
-        let factor = Brightness.factor(for: level)
-        if factor <= 1.0 { return image }
+        if Brightness.factor(for: level) <= 1.0 { return image }
 
         let w = image.width, h = image.height
         brightnessLock.lock()
@@ -126,20 +127,36 @@ enum JPEGEncoder {
 
         var buffer = vImage_Buffer(data: data, height: vImagePixelCount(h),
                                    width: vImagePixelCount(w), rowBytes: ctx.bytesPerRow)
-        // Fixed-point diagonal matrix: RGB × factor, alpha × 1, all over divisor 256
-        let divisor: Int32 = 256
-        let f = Int16((factor * CGFloat(divisor)).rounded())
-        let matrix: [Int16] = [
-            f, 0, 0, 0,
-            0, f, 0, 0,
-            0, 0, f, 0,
-            0, 0, 0, Int16(divisor),
-        ]
-        guard vImageMatrixMultiply_ARGB8888(&buffer, &buffer, matrix, divisor,
-                                            nil, nil, vImage_Flags(kvImageNoFlags))
+        // Tables apply to bytes in memory order — RGBA here, so the brightness
+        // curve goes on the first three and alpha keeps the identity table.
+        let lut = brightnessLUT(level: level)
+        guard vImageTableLookUp_ARGB8888(&buffer, &buffer, lut, lut, lut,
+                                         Self.identityLUT,
+                                         vImage_Flags(kvImageNoFlags))
             == kvImageNoError
         else { return nil }
 
         return ctx.makeImage()
+    }
+
+    private static let identityLUT: [UInt8] = (0...255).map { UInt8($0) }
+
+    // Guarded by brightnessLock, like brightnessCtx
+    nonisolated(unsafe) private static var brightnessLUTs: [Int: [UInt8]] = [:]
+
+    private static func brightnessLUT(level: Int) -> [UInt8] {
+        if let hit = brightnessLUTs[level] { return hit }
+        let factor = Double(Brightness.factor(for: level))
+        func decode(_ c: Double) -> Double {
+            c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        func encode(_ l: Double) -> Double {
+            l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1 / 2.4) - 0.055
+        }
+        let lut = (0...255).map { v in
+            UInt8(clamping: Int((encode(min(1.0, decode(Double(v) / 255) * factor)) * 255).rounded()))
+        }
+        brightnessLUTs[level] = lut
+        return lut
     }
 }

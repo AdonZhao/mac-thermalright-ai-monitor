@@ -1,5 +1,9 @@
-// BrightnessTests.swift — applyBrightness must multiply stored RGB values
-// (PIL ImageEnhance.Brightness semantics, which the LCD vendor tool matches).
+// BrightnessTests.swift — applyBrightness must reproduce the historical
+// brightness curve: decode sRGB to linear, multiply, encode back. Users
+// calibrated their brightness levels against this behavior; a stored-value
+// multiply reads several levels brighter at the same setting (level 8 washes
+// bright colors to white). Expected values below were captured from the
+// original CoreImage implementation and verified against the sRGB formula.
 
 import CoreGraphics
 import Testing
@@ -50,24 +54,25 @@ func brightnessLevel1IsIdentity() throws {
     #expect(px == (100, 50, 20, 255))
 }
 
-@Test("level 2 multiplies stored RGB by 1.3, alpha untouched")
-func brightnessMultipliesStoredValues() throws {
-    // 1.3 × (100, 50, 20) = (130, 65, 26) — exact in stored-value math;
-    // a linear-colorspace multiply would land far away from these.
+@Test("level 2 multiplies linear-light by 1.3, alpha untouched")
+func brightnessMultipliesLinearValues() throws {
+    // srgb_encode(srgb_decode(100,50,20) × 1.3) = (113, 57, 24) — the curve
+    // the original CoreImage path produced. A stored-value multiply would
+    // give (130, 65, 26) and reads far brighter at high levels.
     let image = try #require(makeImage([(100, 50, 20)]))
 
     let out = try #require(JPEGEncoder.applyBrightness(image, level: 2))
 
     let px = try #require(readPixels(out).first)
     let rgb = (px.0, px.1, px.2)
-    #expect(within1(px.0, 130) && within1(px.1, 65) && within1(px.2, 26),
-            Comment(rawValue: "got \(rgb), want ≈(130, 65, 26)"))
+    #expect(within1(px.0, 113) && within1(px.1, 57) && within1(px.2, 24),
+            Comment(rawValue: "got \(rgb), want ≈(113, 57, 24)"))
     #expect(px.3 == 255)
 }
 
 @Test("values that overflow clamp to 255")
 func brightnessClampsAt255() throws {
-    // 1.9 × 200 = 380 → 255; 1.9 × 10 = 19 stays exact
+    // Linear-space at factor 1.9: 200 → clamps to 255, 10 → 17
     let image = try #require(makeImage([(200, 255, 10)]))
 
     let out = try #require(JPEGEncoder.applyBrightness(image, level: 4))
@@ -75,5 +80,19 @@ func brightnessClampsAt255() throws {
     let px = try #require(readPixels(out).first)
     #expect(px.0 == 255)
     #expect(px.1 == 255)
-    #expect(within1(px.2, 19), Comment(rawValue: "B: got \(px.2), want ≈19"))
+    #expect(within1(px.2, 17), Comment(rawValue: "B: got \(px.2), want ≈17"))
+}
+
+@Test("level 8 keeps bright yellow yellow instead of washing it white")
+func brightnessLevel8KeepsHue() throws {
+    // Pikachu-yellow (255, 220, 60) at factor 3.1: linear-space gives
+    // (255, 255, 105) — still yellow. A stored-value multiply gives
+    // (255, 255, 186), visibly washed toward white (the reported bug).
+    let image = try #require(makeImage([(255, 220, 60)]))
+
+    let out = try #require(JPEGEncoder.applyBrightness(image, level: 8))
+
+    let px = try #require(readPixels(out).first)
+    #expect(px.0 == 255 && px.1 == 255)
+    #expect(within1(px.2, 105), Comment(rawValue: "B: got \(px.2), want ≈105"))
 }
