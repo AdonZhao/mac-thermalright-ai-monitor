@@ -70,7 +70,33 @@ extension AgentsSnapshot: Equatable {}
 final class AgentUsageCollector: @unchecked Sendable {
 
     private let fm = FileManager.default
-    private let home = FileManager.default.homeDirectoryForCurrentUser.path
+    private let home: String
+
+    /// `home` is injectable so tests can point the collector at a fixture tree.
+    init(home: String = FileManager.default.homeDirectoryForCurrentUser.path) {
+        self.home = home
+    }
+
+    // MARK: - Transcript parse cache
+    //
+    // The 2s tick re-read and re-parsed the newest session's tail (activity,
+    // plan, model — several hundred KB of JSONL) even when the file hadn't
+    // changed. Parse results are keyed by (path, size, mtime); a miss is the
+    // only place the expensive tail scan runs.
+    private struct TranscriptVersion: Equatable {
+        let path: String
+        let size: UInt64
+        let mtime: Date
+    }
+
+    private typealias ParsedActivity = (
+        project: String?, activity: String?, attention: Bool,
+        step: (current: Int, total: Int, text: String)?, model: String?)
+
+    private var claudeParseCache: (version: TranscriptVersion, value: ParsedActivity)?
+    private var codexParseCache: (version: TranscriptVersion, value: ParsedActivity)?
+    /// How many cache misses actually parsed — observability for tests.
+    private(set) var activityParses = 0
 
     // Incremental state, reset on day rollover
     private var dayKey = ""
@@ -133,10 +159,12 @@ final class AgentUsageCollector: @unchecked Sendable {
         let todayStart = Calendar.current.startOfDay(for: Date())
         var latestPath: String?
         var latestMtime = Date.distantPast
+        var latestSize: UInt64 = 0
         let liveStates = claudeSessionStates()
         // Transcript of the freshest session that is blocked on the user
         var blockedPath: String?
         var blockedMtime = Date.distantPast
+        var blockedSize: UInt64 = 0
 
         for projDir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
             let dirPath = root + "/" + projDir
@@ -146,21 +174,21 @@ final class AgentUsageCollector: @unchecked Sendable {
                 guard let attrs = try? fm.attributesOfItem(atPath: path),
                       let mtime = attrs[.modificationDate] as? Date
                 else { continue }
+                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
                 // Latest session overall (any day) — drives the activity/project
                 // display so the column isn't blank on a day with no runs yet
-                if mtime > latestMtime { latestMtime = mtime; latestPath = path }
+                if mtime > latestMtime { latestMtime = mtime; latestPath = path; latestSize = size }
 
                 // With several sessions running, the most-recently-written one is
                 // whichever is busiest — which would mask a different session sitting
                 // on a permission prompt. Being blocked on you outranks being busy.
                 if mtime > blockedMtime,
                    liveStates[(file as NSString).deletingPathExtension]?.isBlocked == true {
-                    blockedMtime = mtime; blockedPath = path
+                    blockedMtime = mtime; blockedPath = path; blockedSize = size
                 }
 
                 // Token counting is scoped to today only
                 guard mtime >= todayStart else { continue }
-                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
                 consumeNewLines(path: path, size: size, offsets: &claudeOffsets,
                                 prefilter: "\"type\":\"assistant\"") { line in
                     self.accumulateClaudeLine(line)
@@ -176,12 +204,22 @@ final class AgentUsageCollector: @unchecked Sendable {
         var waitingFor: String?
         var model: String?
         var step: (current: Int, total: Int, text: String)?
-        if let blockedPath { latestPath = blockedPath; latestMtime = blockedMtime }
+        if let blockedPath {
+            latestPath = blockedPath; latestMtime = blockedMtime; latestSize = blockedSize
+        }
         if let path = latestPath {
             let ago = max(0, Int(Date().timeIntervalSince(latestMtime)))
             secondsAgo = ago
             let rawWaiting: Bool
-            (project, activity, rawWaiting, step, model) = claudeActivity(path: path)
+            let version = TranscriptVersion(path: path, size: latestSize, mtime: latestMtime)
+            if let cached = claudeParseCache, cached.version == version {
+                (project, activity, rawWaiting, step, model) = cached.value
+            } else {
+                let parsed = claudeActivity(path: path)
+                activityParses += 1
+                claudeParseCache = (version, parsed)
+                (project, activity, rawWaiting, step, model) = parsed
+            }
 
             // A permission prompt and a running tool look IDENTICAL in the transcript
             // — both end on an assistant tool_use with no tool_result yet — so the
@@ -438,6 +476,7 @@ final class AgentUsageCollector: @unchecked Sendable {
 
         var latestPath: String?
         var latestMtime = Date.distantPast
+        var latestSize: UInt64 = 0
 
         for dir in dirs {
             for file in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
@@ -446,12 +485,12 @@ final class AgentUsageCollector: @unchecked Sendable {
                 guard let attrs = try? fm.attributesOfItem(atPath: path),
                       let mtime = attrs[.modificationDate] as? Date
                 else { continue }
+                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
                 // Latest session overall — drives activity/quota display
-                if mtime > latestMtime { latestMtime = mtime; latestPath = path }
+                if mtime > latestMtime { latestMtime = mtime; latestPath = path; latestSize = size }
 
                 // Token counting is scoped to today only
                 guard mtime >= todayStart else { continue }
-                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
                 consumeNewLines(path: path, size: size, offsets: &codexOffsets,
                                 prefilter: "\"token_count\"") { line in
                     self.accumulateCodexLine(line)
@@ -477,9 +516,18 @@ final class AgentUsageCollector: @unchecked Sendable {
             let ago = max(0, Int(Date().timeIntervalSince(latestMtime)))
             secondsAgo = ago
             let rawWaiting: Bool
-            (project, activity, rawWaiting) = codexActivity(path: path)
-            step = codexPlan(path: path)
-            model = codexModel(path: path)
+            let version = TranscriptVersion(path: path, size: latestSize, mtime: latestMtime)
+            if let cached = codexParseCache, cached.version == version {
+                (project, activity, rawWaiting, step, model) = cached.value
+            } else {
+                let act = codexActivity(path: path)
+                let parsed: ParsedActivity = (act.0, act.1, act.2,
+                                              codexPlan(path: path),
+                                              codexModel(path: path))
+                activityParses += 1
+                codexParseCache = (version, parsed)
+                (project, activity, rawWaiting, step, model) = parsed
+            }
             // Actively running = not waiting on the user AND the file just changed
             working = !rawWaiting && ago < 90
             attention = rawWaiting && ago < 900
@@ -552,13 +600,16 @@ final class AgentUsageCollector: @unchecked Sendable {
         return nil
     }
 
+    // Ordered [(step, status)] from the plan array. Key quoting is inconsistent
+    // across Codex versions — `step:"…"` unquoted, `"status":"…"` quoted, or
+    // vice-versa — so match each `{step, status}` pair with tolerant quoting.
+    // Compiled once; recompiling per parse showed up in the CPU profile review.
+    private static let planStepRegex = try? NSRegularExpression(
+        pattern: "\"?step\"?\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*,\\s*"
+            + "\"?status\"?\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+
     private func parseCodexPlan(_ input: String) -> (Int, Int, String)? {
-        // Ordered [(step, status)] from the plan array. Key quoting is inconsistent
-        // across Codex versions — `step:"…"` unquoted, `"status":"…"` quoted, or
-        // vice-versa — so match each `{step, status}` pair with tolerant quoting.
-        let pattern = "\"?step\"?\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*,\\s*"
-            + "\"?status\"?\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\""
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let re = Self.planStepRegex else { return nil }
         let ns = input as NSString
         let matches = re.matches(in: input, range: NSRange(location: 0, length: ns.length))
         guard !matches.isEmpty else { return nil }
