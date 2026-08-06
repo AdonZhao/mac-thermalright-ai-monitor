@@ -12,6 +12,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     private let collector = SystemMetricsCollector()
     private let agentCollector = AgentUsageCollector()
+    private let textWrapper = TextWrapper()
 
     // Background metrics collection — decoupled from frame loop for consistent refresh
     private let metricsQueue = DispatchQueue(label: "com.thermalvision.metrics")
@@ -27,6 +28,117 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     // Reusable CGContext — avoids allocating 3.6MB every 0.5s (prevents CG raster data leak)
     private var reusableCtx: CGContext?
+
+    // MARK: Layer cache
+    //
+    // The data on screen changes every 0.5–2s (metrics ticks), but while a column
+    // animates the frame loop redraws at 15fps — so most frames repaint identical
+    // gauges, bars and text. The frame is therefore split into:
+    //   staticBase    (opaque)      gradient + panels + everything data-driven
+    //   columnsImage  (transparent) the two agent columns' text/content
+    // rebuilt only when the data changes. Each frame just blits base, paints the
+    // animated tints (they sit UNDER the column text, hence the separate columns
+    // layer), blits columns, then draws Pikachu / Bongo Cat / the clock on top.
+    // All guarded by renderMutex, like reusableCtx.
+    //
+    // The two layers invalidate independently: system metrics jitter every
+    // 0.5s and must not re-layout the agent text (the expensive part), and an
+    // agent update must not repaint the gauges. The columns key holds what the
+    // columns actually DISPLAY — time-derived values enter as their formatted
+    // strings, so a seconds tick that still reads "now" changes nothing.
+    private struct StaticKey: Equatable {
+        let cpu: CPUSnapshot
+        let mem: MemorySnapshot
+        let temp: TemperatureSnapshot
+        let sys: SystemSnapshot?
+    }
+
+    private struct ColumnDisplayKey: Equatable {
+        let available: Bool
+        let project: String?
+        let activity: String?
+        let model: String?
+        let waitingFor: String?
+        let agoText: String
+        let agoActive: Bool
+        let stepCurrent: Int?
+        let stepTotal: Int?
+        let tokensTotal: String
+        let tokensIn: String
+        let tokensOut: String
+        // NOT quantized: the quota bar draws this at sub-percent precision
+        let quotaPercent: Double?
+        let quotaResetText: String?
+
+        init(_ u: AgentUsage) {
+            available = u.available
+            project = u.project
+            activity = u.activity
+            model = u.model
+            waitingFor = u.waitingFor
+            (agoText, agoActive) = MonitorRenderer.agoDisplay(u)
+            stepCurrent = u.stepCurrent
+            stepTotal = u.stepTotal
+            tokensTotal = MonitorRenderer.formatTokensCN(u.todayTotalTokens)
+            tokensIn = MonitorRenderer.formatTokensCN(u.todayInputTokens)
+            tokensOut = MonitorRenderer.formatTokensCN(u.todayOutputTokens)
+            quotaPercent = u.quotaUsedPercent
+            quotaResetText = u.quotaResetsAt.map {
+                MonitorRenderer.quotaResetDisplay(secondsUntilReset: max(0, Int($0.timeIntervalSinceNow)))
+            }
+        }
+    }
+
+    private struct ColumnsKey: Equatable {
+        let claude: ColumnDisplayKey
+        let codex: ColumnDisplayKey
+    }
+
+    private var staticCtx: CGContext?
+    private var columnsCtx: CGContext?
+    private var staticBase: CGImage?
+    private var columnsImage: CGImage?
+    private var cachedStaticKey: StaticKey?
+    private var cachedColumnsKey: ColumnsKey?
+    /// Rebuild counts — observability for tests.
+    private(set) var staticLayerRebuilds = 0
+    private(set) var columnsRebuilds = 0
+
+    // Shared date/clock formatting. DateFormatter creation is expensive and the
+    // animated pass used to build three per frame at 15fps for strings that
+    // change once a second (clock) or once a day (date). Locked because render()
+    // (USB queue) and renderScene() (main-thread preview) both format.
+    private let formatterLock = NSLock()
+    private var clockCache: (second: Int, string: String)?
+    private let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    private let weekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "EEEE"
+        return f
+    }()
+
+    /// "HH:mm:ss" for t, cached per whole second. Internal for tests.
+    func clockString(t: Double) -> String {
+        let second = Int(t)
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
+        if let cached = clockCache, cached.second == second { return cached.string }
+        let string = clockFormatter.string(from: Date(timeIntervalSince1970: t))
+        clockCache = (second, string)
+        return string
+    }
 
     // Test mode (--test-flash): force both columns into the flashing state until
     // this deadline, to preview the alert visuals without waiting for a real event
@@ -205,11 +317,125 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         ctx.translateBy(x: 0, y: CGFloat(h)); ctx.scaleBy(x: 1, y: -1)
-        Draw.gradientBackground(ctx)
-        renderCPU(ctx, cpu: cpu, temp: temp, agentsBusy: true)
-        renderAgents(ctx, agents: agents)
-        renderMemory(ctx, mem: mem, sys: sys, agentsBusy: true)
+        renderScene(ctx, cpu: cpu, mem: mem, temp: temp, sys: sys,
+                    agents: agents, t: Date().timeIntervalSince1970)
         return ctx.makeImage()
+    }
+
+    // MARK: - Scene composition
+
+    /// Draw the whole dashboard directly into `ctx` — no caching. One-shot paths
+    /// (simulated preview) use this; it is also the reference the layered path is
+    /// tested against, so the two must stay visually identical.
+    func renderScene(_ ctx: CGContext, cpu: CPUSnapshot, mem: MemorySnapshot,
+                     temp: TemperatureSnapshot, sys: SystemSnapshot?,
+                     agents: AgentsSnapshot, t: Double) {
+        let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
+            || agents.codex.isWorking || agents.codex.needsAttention
+        Draw.gradientBackground(ctx)
+        renderCPUStatic(ctx, cpu: cpu, temp: temp)
+        renderCPUAnimated(ctx, cpuTotal: cpu.total, agentsBusy: agentsBusy, t: t)
+        renderAgentsFrame(ctx)
+        renderColumnTint(ctx, x: AgentsLayout.claudeX, w: AgentsLayout.colW,
+                         py: Layout.panelY, name: "CLAUDE", accent: Color.claude,
+                         usage: agents.claude, t: t)
+        renderColumnContent(ctx, x: AgentsLayout.claudeX, w: AgentsLayout.colW,
+                            py: Layout.panelY, name: "CLAUDE", accent: Color.claude,
+                            usage: agents.claude)
+        renderColumnTint(ctx, x: AgentsLayout.codexX, w: AgentsLayout.colW,
+                         py: Layout.panelY, name: "CODEX", accent: Color.cyan,
+                         usage: agents.codex, t: t)
+        renderColumnContent(ctx, x: AgentsLayout.codexX, w: AgentsLayout.colW,
+                            py: Layout.panelY, name: "CODEX", accent: Color.cyan,
+                            usage: agents.codex)
+        renderMemoryStatic(ctx, mem: mem, sys: sys, t: t)
+        renderMemoryAnimated(ctx, agentsBusy: agentsBusy, t: t)
+    }
+
+    /// Draw the dashboard into `ctx` via the cached layers, rebuilding them only
+    /// when the data changed. Callers must serialize (render() holds renderMutex).
+    func composeLayeredFrame(_ ctx: CGContext, cpu: CPUSnapshot, mem: MemorySnapshot,
+                             temp: TemperatureSnapshot, sys: SystemSnapshot?,
+                             agents: AgentsSnapshot, t: Double) {
+        let staticKey = StaticKey(cpu: cpu, mem: mem, temp: temp, sys: sys)
+        if staticKey != cachedStaticKey || staticBase == nil {
+            rebuildStaticBase(key: staticKey, t: t)
+        }
+        let columnsKey = ColumnsKey(claude: ColumnDisplayKey(agents.claude),
+                                    codex: ColumnDisplayKey(agents.codex))
+        if columnsKey != cachedColumnsKey || columnsImage == nil {
+            rebuildColumns(agents: agents, key: columnsKey)
+        }
+
+        let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
+            || agents.codex.isWorking || agents.codex.needsAttention
+
+        if let base = staticBase { blitFullFrame(ctx, base) }
+        renderColumnTint(ctx, x: AgentsLayout.claudeX, w: AgentsLayout.colW,
+                         py: Layout.panelY, name: "CLAUDE", accent: Color.claude,
+                         usage: agents.claude, t: t)
+        renderColumnTint(ctx, x: AgentsLayout.codexX, w: AgentsLayout.colW,
+                         py: Layout.panelY, name: "CODEX", accent: Color.cyan,
+                         usage: agents.codex, t: t)
+        if let cols = columnsImage { blitFullFrame(ctx, cols) }
+        renderCPUAnimated(ctx, cpuTotal: cpu.total, agentsBusy: agentsBusy, t: t)
+        renderMemoryAnimated(ctx, agentsBusy: agentsBusy, t: t)
+    }
+
+    private func rebuildStaticBase(key: StaticKey, t: Double) {
+        if staticCtx == nil { staticCtx = Self.makeLayerContext() }
+        guard let sctx = staticCtx else { return }
+
+        sctx.saveGState()
+        sctx.translateBy(x: 0, y: CGFloat(Layout.height))
+        sctx.scaleBy(x: 1, y: -1)
+        Draw.gradientBackground(sctx)
+        renderCPUStatic(sctx, cpu: key.cpu, temp: key.temp)
+        renderAgentsFrame(sctx)
+        renderMemoryStatic(sctx, mem: key.mem, sys: key.sys, t: t)
+        staticBase = sctx.makeImage()
+        sctx.restoreGState()
+
+        cachedStaticKey = key
+        staticLayerRebuilds += 1
+    }
+
+    private func rebuildColumns(agents: AgentsSnapshot, key: ColumnsKey) {
+        if columnsCtx == nil { columnsCtx = Self.makeLayerContext() }
+        guard let cctx = columnsCtx else { return }
+
+        // Transparent layer: clear in identity coords, then draw flipped
+        cctx.clear(CGRect(x: 0, y: 0, width: Layout.width, height: Layout.height))
+        cctx.saveGState()
+        cctx.translateBy(x: 0, y: CGFloat(Layout.height))
+        cctx.scaleBy(x: 1, y: -1)
+        renderColumnContent(cctx, x: AgentsLayout.claudeX, w: AgentsLayout.colW,
+                            py: Layout.panelY, name: "CLAUDE", accent: Color.claude,
+                            usage: agents.claude)
+        renderColumnContent(cctx, x: AgentsLayout.codexX, w: AgentsLayout.colW,
+                            py: Layout.panelY, name: "CODEX", accent: Color.cyan,
+                            usage: agents.codex)
+        columnsImage = cctx.makeImage()
+        cctx.restoreGState()
+
+        cachedColumnsKey = key
+        columnsRebuilds += 1
+    }
+
+    private static func makeLayerContext() -> CGContext? {
+        CGContext(data: nil, width: Layout.width, height: Layout.height,
+                  bitsPerComponent: 8, bytesPerRow: Layout.width * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    }
+
+    /// Draw a full-frame image into the flipped context without mirroring it.
+    private func blitFullFrame(_ ctx: CGContext, _ image: CGImage) {
+        ctx.saveGState()
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: 0, y: -CGFloat(Layout.height))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: Layout.width, height: Layout.height))
+        ctx.restoreGState()
     }
 
     // Serializes render() callers — the USB frame loop and the on-Mac preview
@@ -259,15 +485,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ctx.translateBy(x: 0, y: CGFloat(h))
         ctx.scaleBy(x: 1, y: -1)
 
-        // Background
-        Draw.gradientBackground(ctx)
-
-        // Panels
-        let agentsBusy = agents.claude.isWorking || agents.claude.needsAttention
-            || agents.codex.isWorking || agents.codex.needsAttention
-        renderCPU(ctx, cpu: cpu, temp: temp, agentsBusy: agentsBusy)
-        renderAgents(ctx, agents: agents)
-        renderMemory(ctx, mem: mem, sys: sys, agentsBusy: agentsBusy)
+        composeLayeredFrame(ctx, cpu: cpu, mem: mem, temp: temp, sys: sys,
+                            agents: agents, t: Date().timeIntervalSince1970)
 
         let image = ctx.makeImage()
         ctx.restoreGState()
@@ -312,8 +531,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     // MARK: - CPU Panel
 
-    private func renderCPU(_ ctx: CGContext, cpu: CPUSnapshot, temp: TemperatureSnapshot,
-                           agentsBusy: Bool) {
+    private func renderCPUStatic(_ ctx: CGContext, cpu: CPUSnapshot, temp: TemperatureSnapshot) {
         let x = Layout.panelX(0)
         let pw = Layout.panelWidth
         let py = Layout.panelY
@@ -378,24 +596,6 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                       font: Fonts.system(fontSize), color: Color.textS)
         }
 
-        // Pikachu in the left space below the gauge — its electricity scales with
-        // CPU load (the machine's "power draw"). While an AI agent is working it
-        // hops and turns to face left/right, like it's cheering the machine on.
-        if let pika = PikachuAsset.image {
-            let t = Date().timeIntervalSince1970
-            let size: CGFloat = 132
-            var rect = CGRect(x: CGFloat(x + 100) - size / 2, y: CGFloat(py + 210),
-                              width: size, height: size)
-            var flip = false
-            if agentsBusy {
-                let hop = CGFloat(abs(sin(t * .pi * 2)) * 9)   // ~2 hops/sec
-                rect.origin.y -= hop                            // up (flipped coords)
-                flip = Int(t * 2) % 4 >= 2                       // turn every ~1s
-            }
-            drawElectricity(ctx, around: rect, intensity: cpu.total, t: t)
-            drawImageUpright(ctx, pika, in: rect, flipX: flip)
-        }
-
         // Temp + Load — large, spanning the full panel width at the bottom.
         // Label on the left, value right-aligned to the panel edge.
         let rightEdge = CGFloat(x + pw - 18)
@@ -419,6 +619,28 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         let lW = (lStr as NSString).size(withAttributes: [.font: lFont]).width
         Draw.text(ctx, lStr, x: Int(rightEdge - lW), y: loadY,
                   font: lFont, color: Color.textS)
+    }
+
+    /// Pikachu in the left space below the gauge — its electricity scales with
+    /// CPU load (the machine's "power draw"). While an AI agent is working it
+    /// hops and turns to face left/right, like it's cheering the machine on.
+    /// Time-driven, so it draws per frame on top of the cached static layer.
+    private func renderCPUAnimated(_ ctx: CGContext, cpuTotal: Double,
+                                   agentsBusy: Bool, t: Double) {
+        guard let pika = PikachuAsset.image else { return }
+        let x = Layout.panelX(0)
+        let py = Layout.panelY
+        let size: CGFloat = 132
+        var rect = CGRect(x: CGFloat(x + 100) - size / 2, y: CGFloat(py + 210),
+                          width: size, height: size)
+        var flip = false
+        if agentsBusy {
+            let hop = CGFloat(abs(sin(t * .pi * 2)) * 9)   // ~2 hops/sec
+            rect.origin.y -= hop                            // up (flipped coords)
+            flip = Int(t * 2) % 4 >= 2                       // turn every ~1s
+        }
+        drawElectricity(ctx, around: rect, intensity: cpuTotal, t: t)
+        drawImageUpright(ctx, pika, in: rect, flipX: flip)
     }
 
     /// Yellow lightning crackling around Pikachu — more/brighter bolts as `intensity`
@@ -453,8 +675,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     // MARK: - Memory Panel
 
-    private func renderMemory(_ ctx: CGContext, mem: MemorySnapshot, sys: SystemSnapshot?,
-                              agentsBusy: Bool) {
+    private func renderMemoryStatic(_ ctx: CGContext, mem: MemorySnapshot,
+                                    sys: SystemSnapshot?, t: Double) {
         let x = Layout.panelX(4)
         let pw = Layout.panelWidth
         let py = Layout.panelY
@@ -512,8 +734,9 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             ry += 48
         }
 
-        // Bottom: a Bongo Cat tapping the divider "table", then the clock below it.
-        // (Swap monitoring removed — this space now shows the date/time.)
+        // Bottom: the divider "table" the Bongo Cat taps on (the cat itself is
+        // animated and drawn per frame). Swap monitoring removed — this space
+        // shows the date/time.
         let ph = Layout.panelHeight
         let dividerY = py + ph - 116
         let cx0 = x + 16
@@ -521,20 +744,16 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         Draw.line(ctx, from: CGPoint(x: cx0, y: dividerY),
                   to: CGPoint(x: cx0 + cw, y: dividerY), color: Color.border)
 
-        // Bongo cat sits on the left, tapping the divider when an agent is busy
-        let t = Date().timeIntervalSince1970
-        let tapPhase = Int(t * 5) % 2 == 0
-        drawBongoCat(ctx, cx: x + 96, baseY: dividerY, tapping: agentsBusy, phase: tapPhase)
-
         // Right of the cat: date, weekday, uptime, processes
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US")
+        let date = Date(timeIntervalSince1970: t)
+        formatterLock.lock()
+        let dateStr = dateFormatter.string(from: date)
+        let weekdayStr = weekdayFormatter.string(from: date)
+        formatterLock.unlock()
         let ix = x + 190
-        formatter.dateFormat = "yyyy-MM-dd"
-        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 196,
+        Draw.text(ctx, dateStr, x: ix, y: py + ph - 196,
                   font: Fonts.system(22, weight: .semibold), color: Color.textW)
-        formatter.dateFormat = "EEEE"
-        Draw.text(ctx, formatter.string(from: Date()), x: ix, y: py + ph - 170,
+        Draw.text(ctx, weekdayStr, x: ix, y: py + ph - 170,
                   font: Fonts.system(16), color: Color.textS)
 
         let iw = pw - (ix - x) - 16
@@ -551,9 +770,22 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             stat("Procs", "\(sys.processCount)", py + ph - 120)
         }
 
+    }
+
+    /// The memory panel's moving parts: Bongo Cat tapping the divider, and the
+    /// seconds clock below it. Drawn per frame on top of the cached static layer.
+    private func renderMemoryAnimated(_ ctx: CGContext, agentsBusy: Bool, t: Double) {
+        let x = Layout.panelX(4)
+        let pw = Layout.panelWidth
+        let py = Layout.panelY
+        let ph = Layout.panelHeight
+        let dividerY = py + ph - 116
+
+        let tapPhase = Int(t * 5) % 2 == 0
+        drawBongoCat(ctx, cx: x + 96, baseY: dividerY, tapping: agentsBusy, phase: tapPhase)
+
         // Clock — big, centered across the full panel width, below the divider
-        formatter.dateFormat = "HH:mm:ss"
-        Draw.centeredText(ctx, formatter.string(from: Date()),
+        Draw.centeredText(ctx, clockString(t: t),
                           cx: x + pw / 2, y: dividerY + 30,
                           font: Fonts.system(66, weight: .medium), color: Color.textW)
     }
@@ -630,9 +862,21 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
 
     // MARK: - AI Agents Panel (triple width)
 
-    private func renderAgents(_ ctx: CGContext, agents: AgentsSnapshot) {
-        let x = Layout.panelX(1)
-        let pw = Layout.panelWidth * 3 + Layout.gap * 2
+    /// Fixed geometry of the triple-width agents panel, shared by the frame,
+    /// tint and content passes so the three always agree.
+    private enum AgentsLayout {
+        static let x = Layout.panelX(1)
+        static let pw = Layout.panelWidth * 3 + Layout.gap * 2
+        static let midX = x + pw / 2
+        static let colW = pw / 2 - 40
+        static let claudeX = x + 22
+        static let codexX = midX + 18
+    }
+
+    /// The agents panel chrome: panel, title, column divider. Static.
+    private func renderAgentsFrame(_ ctx: CGContext) {
+        let x = AgentsLayout.x
+        let pw = AgentsLayout.pw
         let py = Layout.panelY
         let ph = Layout.panelHeight
 
@@ -641,32 +885,24 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   font: Fonts.system(24, weight: .bold), color: Color.purple)
 
         // Vertical divider between columns
-        let midX = x + pw / 2
-        Draw.line(ctx, from: CGPoint(x: midX, y: py + 52),
-                  to: CGPoint(x: midX, y: py + ph - 14), color: Color.border)
-
-        let colW = pw / 2 - 40
-        renderAgentColumn(ctx, x: x + 22, w: colW, py: py,
-                          name: "CLAUDE", accent: Color.claude, usage: agents.claude)
-        renderAgentColumn(ctx, x: midX + 18, w: colW, py: py,
-                          name: "CODEX", accent: Color.cyan, usage: agents.codex)
+        Draw.line(ctx, from: CGPoint(x: AgentsLayout.midX, y: py + 52),
+                  to: CGPoint(x: AgentsLayout.midX, y: py + ph - 14), color: Color.border)
     }
 
-    private func renderAgentColumn(_ ctx: CGContext, x: Int, w: Int, py: Int,
-                                   name: String, accent: CGColor, usage: AgentUsage) {
+    /// Column background — three states, agent-tinted:
+    ///   needsAttention (done / waiting) → hard on/off blink (high-contrast alert)
+    ///   isWorking      (running a turn)  → slow, gentle breathing (~5s period)
+    ///   idle                            → static tint
+    /// Time-driven, drawn per frame UNDER the cached column content layer.
+    private func renderColumnTint(_ ctx: CGContext, x: Int, w: Int, py: Int,
+                                  name: String, accent: CGColor, usage: AgentUsage,
+                                  t: Double) {
         let ph = Layout.panelHeight
-
-        // Column background — three states, agent-tinted:
-        //   needsAttention (done / waiting) → hard on/off blink (high-contrast alert)
-        //   isWorking      (running a turn)  → slow, gentle breathing (~5s period)
-        //   idle                            → static tint
-        // render() runs every 0.5s, smooth enough for both sin() and the blink.
         let bgRect = CGRect(x: CGFloat(x - 12), y: CGFloat(py + 42),
                             width: CGFloat(w + 24), height: CGFloat(ph - 56))
         let bgPath = CGPath(roundedRect: bgRect, cornerWidth: 12, cornerHeight: 12,
                             transform: nil)
         let base: CGFloat = name == "CLAUDE" ? 0.09 : 0.08
-        let t = Date().timeIntervalSince1970
         let blinkOn = Int(t * 2) % 2 == 0
         // Linear triangle breathing (0→1→0 over 5s). A constant per-frame delta reads
         // far smoother than cosine easing at the display's low frame rate — no stutter
@@ -694,21 +930,18 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             ctx.addPath(bgPath)
             ctx.strokePath()
         }
+    }
+
+    /// Everything data-driven in one agent column — header, project, message,
+    /// tokens, quota. Cached in the transparent columns layer.
+    private func renderColumnContent(_ ctx: CGContext, x: Int, w: Int, py: Int,
+                                     name: String, accent: CGColor, usage: AgentUsage) {
+        let ph = Layout.panelHeight
 
         // Header: name + activity indicator (right-aligned "● now" / "12m ago")
         Draw.text(ctx, name, x: x, y: py + 50,
                   font: Fonts.system(24, weight: .bold), color: accent)
-        let active = (usage.secondsSinceActive ?? Int.max) < 90
-        let agoStr: String
-        if !usage.available {
-            agoStr = "not found"
-        } else if let s = usage.secondsSinceActive {
-            agoStr = active ? "now"
-                : (s < 3600 ? "\(s / 60)m ago"
-                   : (s < 86400 ? "\(s / 3600)h ago" : "\(s / 86400)d ago"))
-        } else {
-            agoStr = "no session"
-        }
+        let (agoStr, active) = MonitorRenderer.agoDisplay(usage)
         let agoFont = Fonts.system(17, weight: .medium)
         let agoColor = active ? Color.green : Color.textD
         let agoW = (agoStr as NSString).size(withAttributes: [.font: agoFont]).width
@@ -772,8 +1005,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                           font: bFont, color: accent)
                 projMaxW = CGFloat(w) - bW - 16
             }
-            Draw.text(ctx, truncate(project, font: Fonts.system(26, weight: .semibold),
-                                    maxW: projMaxW),
+            Draw.text(ctx, textWrapper.truncate(project, font: Fonts.system(26, weight: .semibold),
+                                                maxW: projMaxW),
                       x: x, y: y, font: Fonts.system(26, weight: .semibold), color: Color.textW)
             y += 38
         }
@@ -797,7 +1030,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                   to: CGPoint(x: x + w, y: tokY - 12), color: Color.border)
         Draw.text(ctx, "今日 Token", x: x, y: tokY,
                   font: Fonts.system(19), color: Color.textL)
-        Draw.text(ctx, formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
+        Draw.text(ctx, MonitorRenderer.formatTokensCN(usage.todayTotalTokens), x: x, y: tokY + 24,
                   font: Fonts.system(46, weight: .bold), color: Color.textW)
 
         // In / Out — right-aligned, level with the label + big number
@@ -808,7 +1041,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         ]
         for (i, row) in ioRows.enumerated() {
             let ry = tokY + 6 + i * 30
-            let valStr = formatTokensCN(row.1)
+            let valStr = MonitorRenderer.formatTokensCN(row.1)
             let valW = (valStr as NSString).size(withAttributes: [.font: ioFont]).width
             Draw.text(ctx, valStr, x: Int(CGFloat(x + w) - valW), y: ry,
                       font: ioFont, color: Color.textS)
@@ -826,9 +1059,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
             Draw.text(ctx, String(format: "剩余额度 %.0f%%", remaining), x: x, y: qy,
                       font: Fonts.system(21, weight: .medium), color: qColor)
             if let resets = usage.quotaResetsAt {
-                let secs = max(0, Int(resets.timeIntervalSinceNow))
-                let resetStr = secs >= 86400 ? "\(secs / 86400)天后重置"
-                    : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
+                let resetStr = MonitorRenderer.quotaResetDisplay(
+                    secondsUntilReset: max(0, Int(resets.timeIntervalSinceNow)))
                 let rFont = Fonts.system(17)
                 let rW = (resetStr as NSString).size(withAttributes: [.font: rFont]).width
                 Draw.text(ctx, resetStr, x: Int(CGFloat(x + w) - rW), y: qy + 3,
@@ -863,8 +1095,26 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         }
     }
 
+    /// The header's activity indicator text and whether it counts as active.
+    /// Shared by drawing and the columns cache key so they can't disagree.
+    static func agoDisplay(_ usage: AgentUsage) -> (text: String, active: Bool) {
+        let active = (usage.secondsSinceActive ?? Int.max) < 90
+        if !usage.available { return ("not found", active) }
+        guard let s = usage.secondsSinceActive else { return ("no session", active) }
+        if active { return ("now", active) }
+        let text = s < 3600 ? "\(s / 60)m ago"
+            : (s < 86400 ? "\(s / 3600)h ago" : "\(s / 86400)d ago")
+        return (text, active)
+    }
+
+    /// Quota reset countdown text — shared by drawing and the columns cache key.
+    static func quotaResetDisplay(secondsUntilReset secs: Int) -> String {
+        secs >= 86400 ? "\(secs / 86400)天后重置"
+            : (secs >= 3600 ? "\(secs / 3600)小时后重置" : "\(max(secs / 60, 1))分钟后重置")
+    }
+
     /// 中文数量格式："33.99万"、"1.02亿"。1万以下显示原始数字。
-    private func formatTokensCN(_ n: UInt64) -> String {
+    private static func formatTokensCN(_ n: UInt64) -> String {
         let v = Double(n)
         if v >= 1e8 {
             let y = v / 1e8
@@ -925,8 +1175,8 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                 let remaining = (bottom - cy) / lineH
                 guard remaining > 0 else { break }
                 let cap = max(2, remaining - reserve[i + 1])
-                let wrapped = wrap(stripMarkdown(line), font: proseFont,
-                                   maxW: CGFloat(w), maxLines: min(cap, remaining))
+                let wrapped = textWrapper.wrap(stripMarkdown(line), font: proseFont,
+                                               maxW: CGFloat(w), maxLines: min(cap, remaining))
                 for wl in wrapped {
                     if cy + lineH > bottom { break }
                     Draw.text(ctx, wl, x: x, y: cy, font: proseFont, color: Color.textS)
@@ -984,7 +1234,7 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
                 let cx = x + ci * (colW + colGap)
                 let font = ri == 0 ? headFont : cellFont
                 let color = ri == 0 ? accent : Color.textS
-                Draw.text(ctx, truncate(cell, font: font, maxW: CGFloat(colW)),
+                Draw.text(ctx, textWrapper.truncate(cell, font: font, maxW: CGFloat(colW)),
                           x: cx, y: cy, font: font, color: color)
             }
             cy += rowH
@@ -996,43 +1246,5 @@ final class MonitorRenderer: FrameRenderer, @unchecked Sendable {
         return cy + 4
     }
 
-    /// Truncate a single line with "…" to fit maxW.
-    private func truncate(_ s: String, font: NSFont, maxW: CGFloat) -> String {
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        if (s as NSString).size(withAttributes: attrs).width <= maxW { return s }
-        var t = s
-        while !t.isEmpty {
-            t.removeLast()
-            if ((t + "…") as NSString).size(withAttributes: attrs).width <= maxW {
-                return t + "…"
-            }
-        }
-        return "…"
-    }
-
-    /// Greedy character wrap (activity text may be CJK — no word boundaries).
-    private func wrap(_ s: String, font: NSFont, maxW: CGFloat, maxLines: Int) -> [String] {
-        guard maxLines >= 1 else { return [] }
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        var lines: [String] = []
-        var current = ""
-        for ch in s {
-            let candidate = current + String(ch)
-            if (candidate as NSString).size(withAttributes: attrs).width > maxW {
-                // Reached the last allowed line → fold the whole remainder into it
-                if lines.count == maxLines - 1 {
-                    let rest = String(s[s.index(s.startIndex, offsetBy: lines.joined().count)...])
-                    lines.append(truncate(rest, font: font, maxW: maxW))
-                    return lines
-                }
-                lines.append(current)
-                current = String(ch)
-            } else {
-                current = candidate
-            }
-        }
-        if !current.isEmpty { lines.append(current) }
-        return lines
-    }
 
 }

@@ -23,6 +23,26 @@ struct EngineStatus: Sendable {
     let lastFrameSize: Int
 }
 
+/// Decides whether a status update is worth posting to the main thread.
+/// State transitions (connected/connecting/message) always pass; pure
+/// frame-statistics updates — the 15fps "still Active" after every sent
+/// frame, only frameCount/lastFrameSize ticking — are limited to 1/s so the
+/// frame loop stops scheduling MainActor work per frame.
+struct StatusThrottle {
+    private var lastState: (connected: Bool, connecting: Bool, message: String)?
+    private var lastPostedAt: Double = -.infinity
+
+    mutating func shouldPost(connected: Bool, connecting: Bool, message: String,
+                             now: Double) -> Bool {
+        let state = (connected, connecting, message)
+        let changed = lastState.map { $0 != state } ?? true
+        guard changed || now - lastPostedAt >= 1.0 else { return false }
+        lastState = state
+        lastPostedAt = now
+        return true
+    }
+}
+
 // MARK: - Display Engine (runs entirely off main thread)
 
 final class DisplayEngine: @unchecked Sendable {
@@ -34,6 +54,13 @@ final class DisplayEngine: @unchecked Sendable {
     /// take a `rotate:` flag that only the first call could influence — the
     /// cache short-circuits every call after it — which is the same species of
     /// lying parameter as the encode flag this file's history is about.
+    /// Deadline increment for one frame, nanosecond-precise. Truncating to
+    /// whole milliseconds made 1/15s into 66ms — the loop ran at 15.15fps,
+    /// ~1% frames nobody asked for.
+    static func frameDeadlineStep(_ interval: Double) -> DispatchTimeInterval {
+        .nanoseconds(Int(interval * 1_000_000_000))
+    }
+
     nonisolated(unsafe) private static var _blackFrame: Data?
     static func blackFrame() -> Data? {
         if let f = _blackFrame { return f }
@@ -200,7 +227,7 @@ final class DisplayEngine: @unchecked Sendable {
             // idle at the configured interval to save CPU/power on this always-on app.
             let animating = !night && (set == .systemMonitor) && monitorRenderer.wantsHighFrameRate()
             let frameInterval = night ? 3.0 : (animating ? (1.0 / 15.0) : settings.refreshInterval)
-            nextDeadline = nextDeadline + .milliseconds(Int(frameInterval * 1000))
+            nextDeadline = nextDeadline + DisplayEngine.frameDeadlineStep(frameInterval)
 
             // autoreleasepool forces CG raster data / CGImage release each frame
             // Without this, Core Graphics caches hundreds of 3.6MB images → GB leak
@@ -332,10 +359,17 @@ final class DisplayEngine: @unchecked Sendable {
         }
     }
 
+    // usbQueue-confined, like the frame loop that drives it
+    private var statusThrottle = StatusThrottle()
+
     private func postStatus(
         connected: Bool, connecting: Bool = false,
         deviceInfo: DeviceInfo? = nil, message: String
     ) {
+        guard statusThrottle.shouldPost(connected: connected, connecting: connecting,
+                                        message: message,
+                                        now: Date().timeIntervalSince1970)
+        else { return }
         let status = EngineStatus(
             connected: connected,
             connecting: connecting,

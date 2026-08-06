@@ -83,10 +83,15 @@ enum Fonts {
         let weight: NSFont.Weight
     }
 
+    // Locked: render() (USB frame loop) and renderSimulated() (main-thread
+    // preview) both resolve fonts; unsynchronized dictionary writes crash.
     nonisolated(unsafe) private static var cache: [FontKey: NSFont] = [:]
+    private static let cacheLock = NSLock()
 
     static func system(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
         let key = FontKey(size: size, weight: weight)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         if let cached = cache[key] {
             return cached
         }
